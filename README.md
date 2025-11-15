@@ -12,6 +12,7 @@ A Neovim plugin that integrates DuckDB via LuaJIT FFI to enable SQL queries on C
 - **Schema Inspection**: Inspect buffer schemas with `:DuckDBSchema`
 - **Auto-Detection**: Automatically detects file types from filetype or extension
 - **Full SQL Support**: Leverage DuckDB's complete SQL capabilities
+- **Smart Validation**: Leverage DuckDB's excellent parser to identify and pinpoint CSV/JSON errors with inline diagnostics
 
 ## Requirements
 
@@ -109,11 +110,39 @@ Show the schema of the current buffer or a specific buffer.
 
 List all queryable buffers (CSV, JSON, JSONL).
 
+#### `:DuckDBValidate [buffer]`
+
+Validate CSV, JSON, or JSONL content using DuckDB's parser. This leverages DuckDB's excellent error reporting to identify issues like:
+- Inconsistent column counts in CSV files
+- Malformed JSON syntax
+- Type mismatches
+- Encoding issues
+
+The command will:
+- Display errors and warnings in a floating window
+- Show inline diagnostics with line numbers
+- Pinpoint the exact location of parsing errors
+
+```vim
+:DuckDBValidate               " Validate current buffer
+:DuckDBValidate 5            " Validate buffer 5
+:DuckDBValidate data.csv     " Validate specific buffer
+```
+
+#### `:DuckDBClearValidation [buffer]`
+
+Clear validation diagnostics from a buffer.
+
+```vim
+:DuckDBClearValidation        " Clear diagnostics from current buffer
+```
+
 ### Default Keymaps
 
 - `<leader>dq` (normal mode): Open query prompt
 - `<leader>dq` (visual mode): Execute selected query
 - `<leader>ds`: Show schema of current buffer
+- `<leader>dv`: Validate current buffer
 
 Disable default keymaps in your config:
 
@@ -255,6 +284,131 @@ For large JSON datasets, use JSONL (newline-delimited JSON):
 
 DuckDB auto-detects CSV headers. For headerless CSVs, the plugin will use generated column names.
 
+### Data Validation
+
+The plugin leverages DuckDB's excellent CSV and JSON parser to validate your data files and pinpoint errors with precision.
+
+#### Why Use DuckDB for Validation?
+
+DuckDB's parser is exceptionally good at identifying data issues:
+- **Precise Error Location**: Identifies the exact line and column of errors
+- **Detailed Error Messages**: Explains what went wrong and why
+- **Format-Specific Validation**: Understands CSV structure, JSON syntax, and type constraints
+- **Performance**: Fast validation even on large files
+
+#### Validating CSV Files
+
+Open a CSV file and run:
+
+```vim
+:DuckDBValidate
+```
+
+The plugin will detect issues like:
+- **Inconsistent column counts**: Rows with too few or too many columns
+- **Type mismatches**: Non-numeric values in numeric columns
+- **Encoding problems**: Binary or control characters in text
+- **Quote handling errors**: Unclosed quotes or improper escaping
+
+Example with `examples/invalid_csv.csv`:
+```csv
+name,age,department,salary
+Alice,30,Engineering,95000
+Bob,25,Marketing           ← Missing column
+Charlie,35,Engineering,105000,extra_field  ← Extra column
+```
+
+Running `:DuckDBValidate` will show:
+```
+Validation Results: invalid_csv.csv
+════════════════════════════════════════════════════════════
+
+✗ Errors: 0
+⚠ Warnings: 2
+
+CSV with 8 lines, 0 errors, 2 warnings
+
+Warnings:
+────────────────────────────────────────────────────────────
+1. [schema] Line 3: Inconsistent column count: expected 4 columns, found 3
+2. [schema] Line 4: Inconsistent column count: expected 4 columns, found 5
+```
+
+#### Validating JSON Files
+
+For JSON files, the validator checks:
+- **Syntax errors**: Missing commas, brackets, or quotes
+- **Structure issues**: Invalid nesting or malformed objects
+- **Schema validation**: Whether the JSON is an array (required for queries)
+
+Example with `examples/invalid_json.json`:
+```json
+[
+  {"id": 1, "name": "Alice"},
+  {"id": 2, "name": "Bob",},     ← Trailing comma
+  {
+    "id": 3                       ← Missing comma
+    "name": "Charlie"
+  }
+]
+```
+
+The validator will show the exact line number and error description.
+
+#### Validating JSONL Files
+
+For JSONL (newline-delimited JSON), each line is validated individually:
+
+```vim
+:DuckDBValidate
+```
+
+Issues detected:
+- **Invalid JSON on specific lines**: Shows which line has the error
+- **Type inconsistencies**: Mixed types across lines
+- **Malformed objects**: Missing keys or values
+
+Example with `examples/invalid_jsonl.jsonl`:
+```jsonl
+{"id": 1, "name": "Alice"}
+{"id": 2, "name": "Bob"        ← Missing closing brace
+{"id": 3 "name": "Charlie"}    ← Missing comma
+```
+
+#### Inline Diagnostics
+
+Validation errors appear as inline diagnostics in Neovim, similar to LSP errors:
+- Error messages show in the sign column
+- Hover over highlighted lines to see details
+- Navigate with `:lnext` and `:lprev` or your diagnostic navigation keys
+
+#### Using Validation in Lua
+
+```lua
+local duckdb = require('duckdb')
+
+-- Validate current buffer
+local result, err = duckdb.validate()
+
+if result then
+  print(string.format("Errors: %d, Warnings: %d",
+    #result.errors, #result.warnings))
+
+  for _, error in ipairs(result.errors) do
+    print(string.format("Line %d: %s", error.line, error.message))
+  end
+end
+
+-- Validate specific buffer
+duckdb.validate('data.csv')
+
+-- Validate without showing UI (programmatic validation)
+duckdb.validate(nil, { show_float = false, show_diagnostics = true })
+
+-- Clear diagnostics
+duckdb.clear_validation()
+```
+
 ### Export Results
 
 ```lua
@@ -343,6 +497,31 @@ Get schema information for a buffer.
 
 Get list of all buffers that can be queried.
 
+### `validate(identifier, opts)`
+
+Validate buffer content using DuckDB's parser.
+
+**Parameters:**
+- `identifier` (string|number|nil): Buffer identifier (nil for current buffer)
+- `opts` (table, optional):
+  - `show_diagnostics`: Show inline diagnostics (default: true)
+  - `show_float`: Show floating window with results (default: true)
+
+**Returns:**
+- `result`: ValidationResult object with `errors`, `warnings`, and `valid` fields
+- `error`: Error message or nil
+
+### `validate_current_buffer(opts)`
+
+Validate the current buffer. Shorthand for `validate(nil, opts)`.
+
+### `clear_validation(identifier)`
+
+Clear validation diagnostics from a buffer.
+
+**Parameters:**
+- `identifier` (string|number|nil): Buffer identifier (nil for current buffer)
+
 ## Troubleshooting
 
 ### "DuckDB library not found"
@@ -385,6 +564,7 @@ lua/duckdb/
   buffer.lua               -- Buffer content extraction
   query.lua                -- Query execution engine
   ui.lua                   -- Result display and formatting
+  validate.lua             -- Data validation with error reporting
   health.lua               -- Health checks
 ```
 

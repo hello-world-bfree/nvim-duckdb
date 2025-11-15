@@ -77,6 +77,24 @@ end, {
   desc = 'List all queryable buffers',
 })
 
+-- Create :DuckDBValidate command
+vim.api.nvim_create_user_command('DuckDBValidate', function(args)
+  local buffer_id = args.args ~= '' and args.args or nil
+  duckdb.validate(buffer_id)
+end, {
+  nargs = '?',
+  desc = 'Validate CSV/JSON buffer using DuckDB parser',
+})
+
+-- Create :DuckDBClearValidation command
+vim.api.nvim_create_user_command('DuckDBClearValidation', function(args)
+  local buffer_id = args.args ~= '' and args.args or nil
+  duckdb.clear_validation(buffer_id)
+end, {
+  nargs = '?',
+  desc = 'Clear validation diagnostics for buffer',
+})
+
 -- Setup default keymaps (users can override in their config)
 local function setup_default_keymaps()
   -- Only set if not already mapped
@@ -90,6 +108,12 @@ local function setup_default_keymaps()
     vim.keymap.set('n', '<leader>ds', function()
       require('duckdb').get_schema()
     end, { desc = 'DuckDB: Show schema' })
+  end
+
+  if vim.fn.mapcheck('<leader>dv', 'n') == '' then
+    vim.keymap.set('n', '<leader>dv', function()
+      require('duckdb').validate_current_buffer()
+    end, { desc = 'DuckDB: Validate buffer' })
   end
 
   if vim.fn.mapcheck('<leader>dq', 'v') == '' then

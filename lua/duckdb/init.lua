@@ -6,6 +6,7 @@ local query_module = require('duckdb.query')
 local ui_module = require('duckdb.ui')
 local buffer_module = require('duckdb.buffer')
 local ffi_module = require('duckdb.ffi')
+local validate_module = require('duckdb.validate')
 
 ---@class DuckDBConfig
 ---@field max_rows number Maximum rows to display in results
@@ -269,6 +270,89 @@ function M.get_sql_completions()
   }
 
   return keywords
+end
+
+---Validate buffer content using DuckDB's parser
+---@param identifier string|number|nil Buffer identifier
+---@param opts table? Options
+---  - show_diagnostics: Show inline diagnostics (default: true)
+---  - show_float: Show floating window with results (default: true)
+---@return ValidationResult? result
+---@return string? error
+function M.validate(identifier, opts)
+  opts = opts or {}
+  local show_diagnostics = opts.show_diagnostics ~= false
+  local show_float = opts.show_float ~= false
+
+  -- Check if DuckDB is available
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(
+      string.format('[DuckDB] %s', err),
+      vim.log.levels.ERROR
+    )
+    return nil, err
+  end
+
+  -- Validate buffer
+  local result, validate_err = validate_module.validate_buffer(identifier)
+
+  if not result then
+    vim.notify(
+      string.format('[DuckDB] Validation failed: %s', validate_err),
+      vim.log.levels.ERROR
+    )
+    return nil, validate_err
+  end
+
+  -- Get buffer info for display
+  local buffer_info, _ = buffer_module.get_buffer_info(identifier)
+  local bufnr = buffer_info and buffer_info.bufnr or vim.api.nvim_get_current_buf()
+  local buffer_name = buffer_info and buffer_info.name or 'current buffer'
+
+  -- Set diagnostics if requested
+  if show_diagnostics then
+    validate_module.set_diagnostics(bufnr, result)
+  end
+
+  -- Show floating window if requested
+  if show_float then
+    validate_module.display_validation_results(result, buffer_name)
+  end
+
+  -- Notify user
+  if result.valid and #result.errors == 0 and #result.warnings == 0 then
+    vim.notify('[DuckDB] Validation passed! ✓', vim.log.levels.INFO)
+  elseif #result.errors > 0 then
+    vim.notify(
+      string.format('[DuckDB] Validation failed with %d error(s)', #result.errors),
+      vim.log.levels.ERROR
+    )
+  else
+    vim.notify(
+      string.format('[DuckDB] Validation passed with %d warning(s)', #result.warnings),
+      vim.log.levels.WARN
+    )
+  end
+
+  return result
+end
+
+---Validate current buffer
+---@param opts table? Options
+---@return ValidationResult? result
+---@return string? error
+function M.validate_current_buffer(opts)
+  return M.validate(nil, opts)
+end
+
+---Clear validation diagnostics for a buffer
+---@param identifier string|number|nil Buffer identifier
+function M.clear_validation(identifier)
+  local buffer_info, _ = buffer_module.get_buffer_info(identifier)
+  local bufnr = buffer_info and buffer_info.bufnr or vim.api.nvim_get_current_buf()
+  validate_module.clear_diagnostics(bufnr)
+  vim.notify('[DuckDB] Cleared validation diagnostics', vim.log.levels.INFO)
 end
 
 return M

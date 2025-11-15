@@ -1,0 +1,9 @@
+name,age,department,salary
+Alice,30,Engineering,95000
+Bob,25,Marketing
+Charlie,35,Engineering,105000,extra_field
+Diana,28,Sales,70000
+Eve,thirty-two,Engineering,98000
+Frank,29,Marketing,invalid_salary
+Grace,31,Sales,72000
+Henry,27,Engineering,85000
