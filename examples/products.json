@@ -1,0 +1,66 @@
+[
+  {
+    "id": 1,
+    "name": "Laptop Pro 15",
+    "category": "Electronics",
+    "price": 1299.99,
+    "stock": 45,
+    "rating": 4.5
+  },
+  {
+    "id": 2,
+    "name": "Wireless Mouse",
+    "category": "Electronics",
+    "price": 24.99,
+    "stock": 230,
+    "rating": 4.2
+  },
+  {
+    "id": 3,
+    "name": "Office Desk",
+    "category": "Furniture",
+    "price": 299.99,
+    "stock": 15,
+    "rating": 4.7
+  },
+  {
+    "id": 4,
+    "name": "Ergonomic Chair",
+    "category": "Furniture",
+    "price": 399.99,
+    "stock": 8,
+    "rating": 4.8
+  },
+  {
+    "id": 5,
+    "name": "Monitor 27\"",
+    "category": "Electronics",
+    "price": 349.99,
+    "stock": 62,
+    "rating": 4.6
+  },
+  {
+    "id": 6,
+    "name": "Keyboard Mechanical",
+    "category": "Electronics",
+    "price": 89.99,
+    "stock": 120,
+    "rating": 4.4
+  },
+  {
+    "id": 7,
+    "name": "Desk Lamp",
+    "category": "Furniture",
+    "price": 45.99,
+    "stock": 75,
+    "rating": 4.3
+  },
+  {
+    "id": 8,
+    "name": "USB-C Hub",
+    "category": "Electronics",
+    "price": 49.99,
+    "stock": 95,
+    "rating": 4.1
+  }
+]

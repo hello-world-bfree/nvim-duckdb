@@ -1,0 +1,17 @@
+# Neovim
+*.swp
+*.swo
+*~
+.nvim/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# DuckDB
+*.duckdb
+*.db
+
+# Test outputs
+/tmp/
+/test/output/
