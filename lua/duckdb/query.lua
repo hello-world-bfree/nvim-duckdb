@@ -9,6 +9,7 @@ local buffer_module = require('duckdb.buffer')
 ---@field db ffi.cdata* Database handle
 ---@field conn ffi.cdata* Connection handle
 ---@field temp_dir string? Temporary directory for data files
+---@field _closed boolean Whether the connection has been closed
 
 ---@class QueryResult
 ---@field columns table<string> Column names
@@ -41,15 +42,29 @@ function M.create_connection()
     return nil, "Failed to create DuckDB connection"
   end
 
-  return {
+  -- Create connection object with explicit lifecycle management
+  -- Note: FFI finalizers are unreliable for C library cleanup, so we don't use them.
+  -- Users MUST call close_connection() explicitly to avoid resource leaks.
+  local connection = {
     db = db,
     conn = conn,
+    _closed = false,
   }
+
+  return connection
 end
 
 ---Close DuckDB connection
 ---@param connection DuckDBConnection
 function M.close_connection(connection)
+  -- Prevent double-close which can cause crashes
+  if connection._closed then
+    return
+  end
+  connection._closed = true
+
+  -- Important: Disconnect connection BEFORE closing database
+  -- Wrong order can cause use-after-free crashes
   if connection.conn then
     duckdb_ffi.C.duckdb_disconnect(connection.conn)
     connection.conn = nil
@@ -70,13 +85,20 @@ function M.execute_query(connection, query)
     return nil, "Connection is closed"
   end
 
+  if connection._closed then
+    return nil, "Connection is closed"
+  end
+
   local result = ffi.new("duckdb_result[1]")
+
   local state = duckdb_ffi.C.duckdb_query(connection.conn[0], query, result)
 
   if state ~= 0 then
     local error_msg = "Query failed"
-    if result[0].error_message ~= nil then
-      error_msg = ffi.string(result[0].error_message)
+    -- Use modern accessor function instead of direct struct access
+    local err_ptr = duckdb_ffi.C.duckdb_result_error(result)
+    if err_ptr ~= nil then
+      error_msg = ffi.string(err_ptr)
     end
     duckdb_ffi.C.duckdb_destroy_result(result)
     return nil, error_msg
