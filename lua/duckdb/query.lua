@@ -9,6 +9,8 @@ local buffer_module = require('duckdb.buffer')
 ---@field db ffi.cdata* Database handle
 ---@field conn ffi.cdata* Connection handle
 ---@field temp_dir string? Temporary directory for data files
+---@field _closed boolean Whether the connection has been closed
+---@field _gc_guard ffi.cdata* GC safety net for automatic cleanup
 
 ---@class QueryResult
 ---@field columns table<string> Column names
@@ -41,15 +43,39 @@ function M.create_connection()
     return nil, "Failed to create DuckDB connection"
   end
 
-  return {
+  -- Create connection object with explicit lifecycle management
+  local connection = {
     db = db,
     conn = conn,
+    _closed = false,
   }
+
+  -- Register a weak reference GC guard to ensure cleanup happens
+  -- This acts as a safety net if close_connection is never called
+  local weak_ref = setmetatable({ connection }, { __mode = "v" })
+  local gc_guard = ffi.gc(ffi.new("uint8_t[1]"), function()
+    -- Only cleanup if connection still exists and wasn't explicitly closed
+    local conn_ref = weak_ref[1]
+    if conn_ref and not conn_ref._closed then
+      M.close_connection(conn_ref)
+    end
+  end)
+  connection._gc_guard = gc_guard
+
+  return connection
 end
 
 ---Close DuckDB connection
 ---@param connection DuckDBConnection
 function M.close_connection(connection)
+  -- Prevent double-close which can cause crashes
+  if connection._closed then
+    return
+  end
+  connection._closed = true
+
+  -- Important: Disconnect connection BEFORE closing database
+  -- Wrong order can cause use-after-free crashes
   if connection.conn then
     duckdb_ffi.C.duckdb_disconnect(connection.conn)
     connection.conn = nil
@@ -57,6 +83,12 @@ function M.close_connection(connection)
   if connection.db then
     duckdb_ffi.C.duckdb_close(connection.db)
     connection.db = nil
+  end
+
+  -- Disable the GC guard finalizer since we've cleaned up explicitly
+  if connection._gc_guard then
+    ffi.gc(connection._gc_guard, nil)
+    connection._gc_guard = nil
   end
 end
 
@@ -70,19 +102,35 @@ function M.execute_query(connection, query)
     return nil, "Connection is closed"
   end
 
+  if connection._closed then
+    return nil, "Connection is closed"
+  end
+
   local result = ffi.new("duckdb_result[1]")
+  local result_initialized = false
+
+  -- Wrap result in a GC-safe finalizer to ensure cleanup even on errors
+  local result_guard = ffi.gc(ffi.new("uint8_t[1]"), function()
+    if result_initialized then
+      duckdb_ffi.C.duckdb_destroy_result(result)
+    end
+  end)
+
   local state = duckdb_ffi.C.duckdb_query(connection.conn[0], query, result)
+  result_initialized = true  -- Result now needs cleanup
 
   if state ~= 0 then
     local error_msg = "Query failed"
     if result[0].error_message ~= nil then
       error_msg = ffi.string(result[0].error_message)
     end
+    -- Disable GC guard and cleanup manually
+    ffi.gc(result_guard, nil)
     duckdb_ffi.C.duckdb_destroy_result(result)
     return nil, error_msg
   end
 
-  -- Extract column information
+  -- Extract column information (protected by result_guard)
   local column_count = tonumber(duckdb_ffi.C.duckdb_column_count(result))
   local row_count = tonumber(duckdb_ffi.C.duckdb_row_count(result))
   local rows_changed = tonumber(duckdb_ffi.C.duckdb_rows_changed(result))
@@ -108,6 +156,8 @@ function M.execute_query(connection, query)
     table.insert(rows, row_data)
   end
 
+  -- Disable GC guard and cleanup manually (we're done with the result)
+  ffi.gc(result_guard, nil)
   duckdb_ffi.C.duckdb_destroy_result(result)
 
   return {
