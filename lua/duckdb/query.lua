@@ -10,7 +10,6 @@ local buffer_module = require('duckdb.buffer')
 ---@field conn ffi.cdata* Connection handle
 ---@field temp_dir string? Temporary directory for data files
 ---@field _closed boolean Whether the connection has been closed
----@field _gc_guard ffi.cdata* GC safety net for automatic cleanup
 
 ---@class QueryResult
 ---@field columns table<string> Column names
@@ -44,23 +43,13 @@ function M.create_connection()
   end
 
   -- Create connection object with explicit lifecycle management
+  -- Note: FFI finalizers are unreliable for C library cleanup, so we don't use them.
+  -- Users MUST call close_connection() explicitly to avoid resource leaks.
   local connection = {
     db = db,
     conn = conn,
     _closed = false,
   }
-
-  -- Register a weak reference GC guard to ensure cleanup happens
-  -- This acts as a safety net if close_connection is never called
-  local weak_ref = setmetatable({ connection }, { __mode = "v" })
-  local gc_guard = ffi.gc(ffi.new("uint8_t[1]"), function()
-    -- Only cleanup if connection still exists and wasn't explicitly closed
-    local conn_ref = weak_ref[1]
-    if conn_ref and not conn_ref._closed then
-      M.close_connection(conn_ref)
-    end
-  end)
-  connection._gc_guard = gc_guard
 
   return connection
 end
@@ -83,12 +72,6 @@ function M.close_connection(connection)
   if connection.db then
     duckdb_ffi.C.duckdb_close(connection.db)
     connection.db = nil
-  end
-
-  -- Disable the GC guard finalizer since we've cleaned up explicitly
-  if connection._gc_guard then
-    ffi.gc(connection._gc_guard, nil)
-    connection._gc_guard = nil
   end
 end
 

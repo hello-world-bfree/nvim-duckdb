@@ -30,14 +30,16 @@ describe('DuckDB FFI Cleanup', function()
       query_module.close_connection(conn)
     end)
 
-    it('should have GC guard after creation', function()
+    it('should have required fields after creation', function()
       if not duckdb_ffi.lib then
         pending('DuckDB library not available')
       end
 
       local conn, err = query_module.create_connection()
       assert.is_nil(err)
-      assert.is_not_nil(conn._gc_guard)
+      assert.is_not_nil(conn.db)
+      assert.is_not_nil(conn.conn)
+      assert.is_false(conn._closed)
 
       query_module.close_connection(conn)
     end)
@@ -54,7 +56,7 @@ describe('DuckDB FFI Cleanup', function()
       assert.is_true(conn._closed)
     end)
 
-    it('should remove GC guard after explicit close', function()
+    it('should clear connection pointers after close', function()
       if not duckdb_ffi.lib then
         pending('DuckDB library not available')
       end
@@ -63,7 +65,8 @@ describe('DuckDB FFI Cleanup', function()
       assert.is_nil(err)
 
       query_module.close_connection(conn)
-      assert.is_nil(conn._gc_guard)
+      assert.is_nil(conn.db)
+      assert.is_nil(conn.conn)
     end)
 
     it('should handle double-close without crashing', function()
@@ -267,25 +270,7 @@ describe('DuckDB FFI Cleanup', function()
     end)
   end)
 
-  describe('GC Safety Net', function()
-    it('should have weak reference in GC guard', function()
-      if not duckdb_ffi.lib then
-        pending('DuckDB library not available')
-      end
-
-      local conn, err = query_module.create_connection()
-      assert.is_nil(err)
-
-      -- The GC guard should exist
-      assert.is_not_nil(conn._gc_guard)
-
-      -- Explicitly close to test normal path
-      query_module.close_connection(conn)
-
-      -- Guard should be nil after close
-      assert.is_nil(conn._gc_guard)
-    end)
-
+  describe('Garbage Collection Safety', function()
     it('should survive garbage collection after explicit close', function()
       if not duckdb_ffi.lib then
         pending('DuckDB library not available')
@@ -302,6 +287,28 @@ describe('DuckDB FFI Cleanup', function()
       end
 
       assert.is_true(conn._closed)
+    end)
+
+    it('should handle connection table becoming garbage', function()
+      if not duckdb_ffi.lib then
+        pending('DuckDB library not available')
+      end
+
+      -- Create and close connection, then let it be garbage collected
+      local function create_and_close()
+        local conn, err = query_module.create_connection()
+        if err then return end
+        query_module.execute_query(conn, 'SELECT 1')
+        query_module.close_connection(conn)
+      end
+
+      create_and_close()
+      collectgarbage('collect')
+
+      -- Should be able to create new connection after GC
+      local conn2, err2 = query_module.create_connection()
+      assert.is_nil(err2)
+      query_module.close_connection(conn2)
     end)
   end)
 
