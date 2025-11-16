@@ -90,7 +90,11 @@ function M.execute_query(connection, query)
   local columns = {}
   for col = 0, column_count - 1 do
     local col_name = duckdb_ffi.C.duckdb_column_name(result, col)
-    table.insert(columns, ffi.string(col_name))
+    if col_name ~= nil then
+      table.insert(columns, ffi.string(col_name))
+    else
+      table.insert(columns, string.format("column_%d", col))
+    end
   end
 
   -- Extract row data
