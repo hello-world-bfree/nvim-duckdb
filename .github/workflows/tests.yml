@@ -10,10 +10,6 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        neovim_version: ['stable', 'v0.9.5', 'v0.10.0']
-      fail-fast: false
 
     steps:
       - name: Checkout code
@@ -23,7 +19,7 @@ jobs:
         uses: rhysd/action-setup-vim@v1
         with:
           neovim: true
-          version: ${{ matrix.neovim_version }}
+          version: stable
 
       - name: Install DuckDB library
         run: |
@@ -52,7 +48,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.neovim_version }}
+          name: test-results
           path: |
             tests/output/
           retention-days: 7

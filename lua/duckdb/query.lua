@@ -90,30 +90,19 @@ function M.execute_query(connection, query)
   end
 
   local result = ffi.new("duckdb_result[1]")
-  local result_initialized = false
-
-  -- Wrap result in a GC-safe finalizer to ensure cleanup even on errors
-  local result_guard = ffi.gc(ffi.new("uint8_t[1]"), function()
-    if result_initialized then
-      duckdb_ffi.C.duckdb_destroy_result(result)
-    end
-  end)
 
   local state = duckdb_ffi.C.duckdb_query(connection.conn[0], query, result)
-  result_initialized = true  -- Result now needs cleanup
 
   if state ~= 0 then
     local error_msg = "Query failed"
     if result[0].error_message ~= nil then
       error_msg = ffi.string(result[0].error_message)
     end
-    -- Disable GC guard and cleanup manually
-    ffi.gc(result_guard, nil)
     duckdb_ffi.C.duckdb_destroy_result(result)
     return nil, error_msg
   end
 
-  -- Extract column information (protected by result_guard)
+  -- Extract column information
   local column_count = tonumber(duckdb_ffi.C.duckdb_column_count(result))
   local row_count = tonumber(duckdb_ffi.C.duckdb_row_count(result))
   local rows_changed = tonumber(duckdb_ffi.C.duckdb_rows_changed(result))
@@ -139,8 +128,6 @@ function M.execute_query(connection, query)
     table.insert(rows, row_data)
   end
 
-  -- Disable GC guard and cleanup manually (we're done with the result)
-  ffi.gc(result_guard, nil)
   duckdb_ffi.C.duckdb_destroy_result(result)
 
   return {
