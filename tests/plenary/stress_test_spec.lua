@@ -6,8 +6,8 @@ local ffi = require('ffi')
 describe("duckdb stress tests", function()
   local duckdb_ffi
 
-  setup(function()
-    -- Load FFI module once (C definitions are global)
+  before_each(function()
+    -- Load FFI module (C definitions are global, only loaded once)
     duckdb_ffi = require('duckdb.ffi')
   end)
 
