@@ -7,39 +7,43 @@ local ffi = require('ffi')
 -- Guard against multiple ffi.cdef calls (LuaJIT doesn't allow redefining types)
 -- This is necessary for test environments that reload modules
 if not pcall(ffi.typeof, 'duckdb_database') then
-  -- DuckDB C API declarations
+  -- DuckDB C API declarations (modern opaque API)
+  -- Note: duckdb_result is opaque - use accessor functions instead of direct struct access
   ffi.cdef[[
     // Type definitions
     typedef enum {
       DUCKDB_TYPE_INVALID = 0,
-      DUCKDB_TYPE_BOOLEAN,
-      DUCKDB_TYPE_TINYINT,
-      DUCKDB_TYPE_SMALLINT,
-      DUCKDB_TYPE_INTEGER,
-      DUCKDB_TYPE_BIGINT,
-      DUCKDB_TYPE_UTINYINT,
-      DUCKDB_TYPE_USMALLINT,
-      DUCKDB_TYPE_UINTEGER,
-      DUCKDB_TYPE_UBIGINT,
-      DUCKDB_TYPE_FLOAT,
-      DUCKDB_TYPE_DOUBLE,
-      DUCKDB_TYPE_TIMESTAMP,
-      DUCKDB_TYPE_DATE,
-      DUCKDB_TYPE_TIME,
-      DUCKDB_TYPE_INTERVAL,
-      DUCKDB_TYPE_HUGEINT,
-      DUCKDB_TYPE_VARCHAR,
-      DUCKDB_TYPE_BLOB,
-      DUCKDB_TYPE_DECIMAL,
-      DUCKDB_TYPE_TIMESTAMP_S,
-      DUCKDB_TYPE_TIMESTAMP_MS,
-      DUCKDB_TYPE_TIMESTAMP_NS,
-      DUCKDB_TYPE_ENUM,
-      DUCKDB_TYPE_LIST,
-      DUCKDB_TYPE_STRUCT,
-      DUCKDB_TYPE_MAP,
-      DUCKDB_TYPE_UUID,
-      DUCKDB_TYPE_JSON,
+      DUCKDB_TYPE_BOOLEAN = 1,
+      DUCKDB_TYPE_TINYINT = 2,
+      DUCKDB_TYPE_SMALLINT = 3,
+      DUCKDB_TYPE_INTEGER = 4,
+      DUCKDB_TYPE_BIGINT = 5,
+      DUCKDB_TYPE_UTINYINT = 6,
+      DUCKDB_TYPE_USMALLINT = 7,
+      DUCKDB_TYPE_UINTEGER = 8,
+      DUCKDB_TYPE_UBIGINT = 9,
+      DUCKDB_TYPE_FLOAT = 10,
+      DUCKDB_TYPE_DOUBLE = 11,
+      DUCKDB_TYPE_TIMESTAMP = 12,
+      DUCKDB_TYPE_DATE = 13,
+      DUCKDB_TYPE_TIME = 14,
+      DUCKDB_TYPE_INTERVAL = 15,
+      DUCKDB_TYPE_HUGEINT = 16,
+      DUCKDB_TYPE_VARCHAR = 17,
+      DUCKDB_TYPE_BLOB = 18,
+      DUCKDB_TYPE_DECIMAL = 19,
+      DUCKDB_TYPE_TIMESTAMP_S = 20,
+      DUCKDB_TYPE_TIMESTAMP_MS = 21,
+      DUCKDB_TYPE_TIMESTAMP_NS = 22,
+      DUCKDB_TYPE_ENUM = 23,
+      DUCKDB_TYPE_LIST = 24,
+      DUCKDB_TYPE_STRUCT = 25,
+      DUCKDB_TYPE_MAP = 26,
+      DUCKDB_TYPE_UUID = 27,
+      DUCKDB_TYPE_UNION = 28,
+      DUCKDB_TYPE_BIT = 29,
+      DUCKDB_TYPE_TIME_TZ = 30,
+      DUCKDB_TYPE_TIMESTAMP_TZ = 31,
     } duckdb_type;
 
     typedef enum {
@@ -47,22 +51,18 @@ if not pcall(ffi.typeof, 'duckdb_database') then
       DuckDBError = 1
     } duckdb_state;
 
+    // Opaque handle types
     typedef void* duckdb_database;
     typedef void* duckdb_connection;
 
+    // Result is an opaque struct - internal layout is not exposed
+    // Must use accessor functions to interact with it
     typedef struct {
-      void* data;
-      bool* nullmask;
-      duckdb_type type;
-      char* name;
-    } duckdb_column;
-
-    typedef struct {
-      uint64_t column_count;
-      uint64_t row_count;
-      uint64_t rows_changed;
-      duckdb_column* columns;
-      char* error_message;
+      void* __deprecated_data;  // Internal use only
+      void* __deprecated_nulls; // Internal use only
+      void* __deprecated_types; // Internal use only
+      void* __deprecated_names; // Internal use only
+      void* internal_data;      // Opaque internal pointer
     } duckdb_result;
 
     // Database operations
@@ -78,7 +78,10 @@ if not pcall(ffi.typeof, 'duckdb_database') then
     duckdb_state duckdb_query(duckdb_connection connection, const char* query, duckdb_result* out_result);
     void duckdb_destroy_result(duckdb_result* result);
 
-    // Result accessors
+    // Result error handling (modern API - use these instead of direct struct access)
+    const char* duckdb_result_error(duckdb_result* result);
+
+    // Result accessors (these work with the opaque struct)
     const char* duckdb_column_name(duckdb_result* result, uint64_t col);
     duckdb_type duckdb_column_type(duckdb_result* result, uint64_t col);
     uint64_t duckdb_column_count(duckdb_result* result);

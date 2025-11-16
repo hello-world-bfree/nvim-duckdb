@@ -158,9 +158,28 @@ describe('DuckDB FFI Stress Tests', function()
   end)
 
   describe('Error Recovery', function()
-    -- NOTE: Error recovery tests are disabled because the deprecated duckdb_result
-    -- struct definition causes crashes when accessing error_message field.
-    -- These tests will be re-enabled once we migrate to the modern DuckDB API.
+    it('should recover from consecutive query errors', function()
+      if not duckdb_ffi.lib then
+        pending('DuckDB library not available')
+      end
+
+      local conn, err = query_module.create_connection()
+      assert.is_nil(err)
+
+      -- Cause multiple errors
+      for i = 1, 10 do
+        local result, query_err = query_module.execute_query(conn, 'INVALID SYNTAX ' .. i)
+        assert.is_nil(result)
+        assert.is_not_nil(query_err)
+      end
+
+      -- Connection should still be usable
+      local result, query_err = query_module.execute_query(conn, 'SELECT 1 as success')
+      assert.is_nil(query_err)
+      assert.equals(1, result.rows[1][1])
+
+      query_module.close_connection(conn)
+    end)
 
     it('should handle connection reuse after successful queries', function()
       if not duckdb_ffi.lib then
@@ -178,6 +197,31 @@ describe('DuckDB FFI Stress Tests', function()
       end
 
       query_module.close_connection(conn)
+    end)
+
+    it('should handle interleaved successes and failures', function()
+      if not duckdb_ffi.lib then
+        pending('DuckDB library not available')
+      end
+
+      local conn, err = query_module.create_connection()
+      assert.is_nil(err)
+
+      for i = 1, 15 do
+        if i % 3 == 0 then
+          -- Error case
+          local result, query_err = query_module.execute_query(conn, 'BAD SQL')
+          assert.is_nil(result)
+        else
+          -- Success case
+          local result, query_err = query_module.execute_query(conn, 'SELECT ' .. i)
+          assert.is_nil(query_err)
+          assert.equals(i, result.rows[1][1])
+        end
+      end
+
+      query_module.close_connection(conn)
+      collectgarbage('collect')
     end)
   end)
 

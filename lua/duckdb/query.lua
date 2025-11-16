@@ -95,8 +95,10 @@ function M.execute_query(connection, query)
 
   if state ~= 0 then
     local error_msg = "Query failed"
-    if result[0].error_message ~= nil then
-      error_msg = ffi.string(result[0].error_message)
+    -- Use modern accessor function instead of direct struct access
+    local err_ptr = duckdb_ffi.C.duckdb_result_error(result)
+    if err_ptr ~= nil then
+      error_msg = ffi.string(err_ptr)
     end
     duckdb_ffi.C.duckdb_destroy_result(result)
     return nil, error_msg
