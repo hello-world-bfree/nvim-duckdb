@@ -8,9 +8,10 @@ describe('DuckDB FFI Cleanup', function()
   local duckdb_ffi
 
   before_each(function()
-    -- Fresh module load for each test
+    -- Reload query module for fresh state, but keep FFI module
+    -- (FFI C definitions can only be loaded once per process)
     package.loaded['duckdb.query'] = nil
-    package.loaded['duckdb.ffi'] = nil
+    package.loaded['duckdb.buffer'] = nil
     query_module = require('duckdb.query')
     duckdb_ffi = require('duckdb.ffi')
   end)
