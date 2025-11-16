@@ -131,9 +131,5 @@ vim.defer_fn(function()
   end
 end, 100)
 
--- Register health check
-vim.api.nvim_create_user_command('checkhealth duckdb', function()
-  require('duckdb.health').check()
-end, {
-  desc = 'Check DuckDB plugin health',
-})
+-- Health check is automatically discovered by Neovim
+-- Run :checkhealth duckdb to use it
