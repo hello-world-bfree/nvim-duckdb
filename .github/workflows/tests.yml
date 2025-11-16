@@ -1,0 +1,84 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        neovim_version: ['stable', 'v0.9.5', 'v0.10.0']
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.neovim_version }}
+
+      - name: Install DuckDB library
+        run: |
+          # Download and install DuckDB C library
+          DUCKDB_VERSION="1.1.2"
+          wget -q "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-linux-amd64.zip"
+          unzip -q libduckdb-linux-amd64.zip
+          sudo mv libduckdb.so /usr/local/lib/
+          sudo ldconfig
+
+          # Verify installation
+          ldconfig -p | grep duckdb || echo "DuckDB library installed to /usr/local/lib"
+
+      - name: Install plenary.nvim
+        run: |
+          git clone --depth 1 https://github.com/nvim-lua/plenary.nvim /tmp/plenary.nvim
+
+      - name: Run tests
+        env:
+          PLENARY_DIR: /tmp/plenary.nvim
+        run: |
+          chmod +x tests/run_tests.sh
+          tests/run_tests.sh
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.neovim_version }}
+          path: |
+            tests/output/
+          retention-days: 7
+
+  lint:
+    name: Lua Lint Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "luajit-2.1.0-beta3"
+
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v4
+
+      - name: Install luacheck
+        run: luarocks install luacheck
+
+      - name: Run luacheck
+        run: |
+          luacheck lua/ \
+            --globals vim describe it before_each pending assert \
+            --ignore 212 \
+            --max-line-length 120 \
+            --no-unused-args || true
