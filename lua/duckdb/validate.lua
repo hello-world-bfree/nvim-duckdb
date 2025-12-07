@@ -1,16 +1,18 @@
 ---@class DuckDBValidate
 ---Validation module that leverages DuckDB's excellent error reporting
+---Uses reject_errors and reject_scans tables for detailed CSV validation
 local M = {}
 
-local query_module = require('duckdb.query')
-local buffer_module = require('duckdb.buffer')
+local query_module = require("duckdb.query")
+local buffer_module = require("duckdb.buffer")
 
 ---@class ValidationError
----@field line number|nil Line number where error occurred
----@field column number|nil Column number where error occurred
+---@field line number|nil Line number where error occurred (1-based)
+---@field column number|nil Column number where error occurred (1-based)
 ---@field message string Error message
 ---@field severity string "error" | "warning" | "info"
----@field error_type string Type of error (e.g., "parse", "type", "schema")
+---@field error_type string Type of error (e.g., "CAST", "MISSING COLUMNS", "schema")
+---@field csv_line string|nil The actual CSV line content (for CSV errors)
 
 ---@class ValidationResult
 ---@field valid boolean Whether the buffer is valid
@@ -18,49 +20,201 @@ local buffer_module = require('duckdb.buffer')
 ---@field warnings table<ValidationError> List of warnings
 ---@field info string|nil Additional information
 
+---@class CSVRejectError
+---@field line number Line number in source file (1-based)
+---@field column_idx number Column index (0-based)
+---@field column_name string|nil Column name
+---@field error_type string Type of error (CAST, MISSING COLUMNS, etc.)
+---@field csv_line string The actual CSV line content
+---@field error_message string Detailed error message
+
+-- ============================================================================
+-- CSV Column Position Helper
+-- ============================================================================
+
+---Find character position of nth CSV column in a line (handles quoted fields)
+---@param line string CSV line content
+---@param column_num number 1-based column number
+---@return number col 0-based character position
+local function find_csv_column_position(line, column_num)
+  if column_num <= 1 then
+    return 0
+  end
+
+  local pos = 0
+  local col_count = 1
+  local in_quotes = false
+
+  for i = 1, #line do
+    local char = line:sub(i, i)
+    if char == '"' then
+      in_quotes = not in_quotes
+    elseif char == ',' and not in_quotes then
+      col_count = col_count + 1
+      if col_count == column_num then
+        return i -- Position after the comma
+      end
+    end
+    pos = i
+  end
+
+  return 0
+end
+
+-- ============================================================================
+-- CSV Validation with reject_errors/reject_scans
+-- ============================================================================
+
+---Try to parse CSV content with DuckDB and capture reject errors
+---@param file_path string Path to CSV file
+---@return boolean success
+---@return CSVRejectError[]|nil errors Array of reject errors (nil on connection failure)
+---@return string|nil scan_info Information about the scan
+local function try_parse_csv_with_rejects(file_path)
+  local conn, err = query_module.create_connection()
+  if not conn then
+    return false, nil, "Failed to create DuckDB connection: " .. (err or "unknown error")
+  end
+
+  local errors = {}
+  local scan_info = nil
+  local success = true
+
+  local ok, parse_err = pcall(function()
+    -- Read CSV with store_rejects enabled and ignore_errors to continue past errors
+    local escaped_path = file_path:gsub("'", "''")
+    local read_query = string.format([[
+      SELECT * FROM read_csv('%s',
+        sample_size=-1,
+        store_rejects=true,
+        ignore_errors=true
+      )
+    ]], escaped_path)
+
+    -- Execute the read (this populates reject tables even if it succeeds)
+    local _, query_err = query_module.execute_query(conn, read_query)
+
+    -- Query errors is expected if CSV is malformed - we continue to check reject tables
+
+    -- Query reject_errors table for detailed error information
+    local reject_result = query_module.execute_query(conn, [[
+      SELECT
+        line,
+        column_idx,
+        column_name,
+        error_type,
+        csv_line,
+        error_message
+      FROM reject_errors
+      ORDER BY line, column_idx
+    ]])
+
+    if reject_result and reject_result.row_count > 0 then
+      success = false
+      for _, row in ipairs(reject_result.rows) do
+        table.insert(errors, {
+          line = tonumber(row[1]) or 1,
+          column_idx = tonumber(row[2]) or 0,
+          column_name = row[3] or "unknown",
+          error_type = row[4] or "unknown",
+          csv_line = row[5] or "",
+          error_message = row[6] or "Unknown error",
+        })
+      end
+    end
+
+    -- Query reject_scans for scan metadata
+    local scan_result = query_module.execute_query(conn, [[
+      SELECT file_path, delimiter FROM reject_scans LIMIT 1
+    ]])
+
+    if scan_result and scan_result.row_count > 0 then
+      local row = scan_result.rows[1]
+      scan_info = string.format("File: %s, Delimiter: '%s'", row[1] or "?", row[2] or ",")
+    end
+  end)
+
+  query_module.close_connection(conn)
+
+  if not ok then
+    return false, nil, tostring(parse_err)
+  end
+
+  return success or #errors == 0, errors, scan_info
+end
+
+---Validate CSV content and provide detailed error information using reject tables
+---@param file_path string Path to CSV file
+---@return ValidationResult result
+local function validate_csv(file_path)
+  local result = {
+    valid = true,
+    errors = {},
+    warnings = {},
+    info = nil,
+  }
+
+  local success, reject_errors, scan_info = try_parse_csv_with_rejects(file_path)
+
+  if reject_errors and #reject_errors > 0 then
+    result.valid = false
+
+    for _, err in ipairs(reject_errors) do
+      table.insert(result.errors, {
+        line = err.line,
+        column = err.column_idx + 1,  -- Convert 0-based to 1-based
+        message = string.format("[%s] %s (column: %s)",
+          err.error_type,
+          err.error_message,
+          err.column_name
+        ),
+        severity = "error",
+        error_type = err.error_type,
+        csv_line = err.csv_line,
+      })
+    end
+  elseif not success then
+    -- Connection or parsing failed entirely
+    table.insert(result.errors, {
+      line = 1,
+      message = "Failed to parse CSV file",
+      severity = "error",
+      error_type = "parse",
+    })
+    result.valid = false
+  end
+
+  -- Build info string
+  local error_count = #result.errors
+  if scan_info then
+    result.info = scan_info
+  end
+
+  if error_count > 0 then
+    result.info = (result.info or "") .. string.format(" | %d validation error(s) found", error_count)
+  else
+    result.info = (result.info or "") .. " | No errors found"
+  end
+
+  return result
+end
+
+-- ============================================================================
+-- JSON Validation
+-- ============================================================================
+
 ---Parse DuckDB error message to extract line/column information
 ---@param error_msg string Error message from DuckDB
----@param format string File format (csv, json, jsonl)
 ---@return table<ValidationError> errors
-local function parse_duckdb_error(error_msg, format)
+local function parse_duckdb_error(error_msg)
   local errors = {}
-
-  -- Common patterns in DuckDB error messages
-  local patterns = {
-    -- CSV line number patterns
-    { pattern = "line (%d+)", type = "line" },
-    { pattern = "on line (%d+)", type = "line" },
-    { pattern = "at line (%d+)", type = "line" },
-    { pattern = "row (%d+)", type = "line" },
-
-    -- CSV column patterns
-    { pattern = "column (%d+)", type = "column" },
-    { pattern = "field (%d+)", type = "column" },
-
-    -- JSON line patterns
-    { pattern = "byte (%d+)", type = "byte" },
-    { pattern = "position (%d+)", type = "position" },
-  }
 
   local line_num = nil
   local col_num = nil
 
-  -- Try to extract line/column numbers
-  for _, pat in ipairs(patterns) do
-    local match = error_msg:match(pat.pattern)
-    if match then
-      local num = tonumber(match)
-      if pat.type == "line" or pat.type == "row" then
-        line_num = num
-      elseif pat.type == "column" or pat.type == "field" then
-        col_num = num
-      elseif pat.type == "byte" or pat.type == "position" then
-        -- For JSON, try to convert byte position to line number
-        -- This is approximate and would need the actual content
-        line_num = num
-      end
-    end
-  end
+  -- Try to extract line/column numbers from error message
+  line_num = error_msg:match("line (%d+)") or error_msg:match("Line: (%d+)")
+  col_num = error_msg:match("column (%d+)") or error_msg:match("position (%d+)")
 
   -- Determine error type based on message content
   local error_type = "parse"
@@ -68,15 +222,13 @@ local function parse_duckdb_error(error_msg, format)
     error_type = "type"
   elseif error_msg:match("[Ss]chema") or error_msg:match("[Cc]olumn") then
     error_type = "schema"
-  elseif error_msg:match("[Qq]uote") or error_msg:match("[Dd]elimiter") then
-    error_type = "format"
   elseif error_msg:match("JSON") or error_msg:match("json") then
     error_type = "json"
   end
 
   table.insert(errors, {
-    line = line_num,
-    column = col_num,
+    line = line_num and tonumber(line_num) or nil,
+    column = col_num and tonumber(col_num) or nil,
     message = error_msg,
     severity = "error",
     error_type = error_type,
@@ -85,153 +237,10 @@ local function parse_duckdb_error(error_msg, format)
   return errors
 end
 
----Try to parse content with DuckDB and capture detailed errors
----@param content string Buffer content
----@param format string File format
----@return boolean success
----@return string? error_message
-local function try_parse_with_duckdb(content, format)
-  local conn, err = query_module.create_connection()
-  if not conn then
-    return false, "Failed to create DuckDB connection: " .. (err or "unknown error")
-  end
-
-  local success = false
-  local error_message = nil
-
-  -- Wrap in pcall to catch any errors
-  local ok = pcall(function()
-    local query
-
-    if format == 'csv' then
-      -- Use DuckDB's read_csv with strict settings to catch errors
-      query = string.format(
-        "SELECT * FROM read_csv(%s, auto_detect=true, sample_size=-1, ignore_errors=false, all_varchar=false)",
-        vim.inspect(content)
-      )
-    elseif format == 'json' then
-      -- Use DuckDB's read_json with strict settings
-      query = string.format(
-        "SELECT * FROM read_json(%s, auto_detect=true, format='auto')",
-        vim.inspect(content)
-      )
-    elseif format == 'jsonl' then
-      -- Use DuckDB's read_json for newline-delimited JSON
-      query = string.format(
-        "SELECT * FROM read_json(%s, auto_detect=true, format='newline_delimited')",
-        vim.inspect(content)
-      )
-    else
-      error("Unsupported format: " .. format)
-    end
-
-    -- Try to execute the query
-    local result, query_err = query_module.execute_query(conn, query)
-
-    if result then
-      success = true
-    else
-      error_message = query_err
-    end
-  end)
-
-  query_module.close_connection(conn)
-
-  if not ok then
-    return false, "Parsing failed"
-  end
-
-  return success, error_message
-end
-
----Validate CSV content and provide detailed error information
----@param content string CSV content
----@param bufnr number Buffer number for context
----@return ValidationResult result
-local function validate_csv(content, bufnr)
-  local result = {
-    valid = true,
-    errors = {},
-    warnings = {},
-  }
-
-  -- Basic checks first
-  local lines = vim.split(content, '\n', { plain = true })
-
-  if #lines == 0 then
-    table.insert(result.errors, {
-      line = 1,
-      message = "CSV file is empty",
-      severity = "error",
-      error_type = "schema",
-    })
-    result.valid = false
-    return result
-  end
-
-  -- Try parsing with DuckDB
-  local success, error_msg = try_parse_with_duckdb(content, 'csv')
-
-  if not success and error_msg then
-    result.valid = false
-    local parsed_errors = parse_duckdb_error(error_msg, 'csv')
-    for _, err in ipairs(parsed_errors) do
-      table.insert(result.errors, err)
-    end
-  end
-
-  -- Additional CSV-specific validations
-  if result.valid then
-    -- Check for inconsistent column counts
-    local header_cols = #vim.split(lines[1], ',', { plain = true })
-
-    for i = 2, math.min(#lines, 100) do  -- Check first 100 lines
-      if lines[i]:match('%S') then  -- Skip empty lines
-        local cols = #vim.split(lines[i], ',', { plain = true })
-        if cols ~= header_cols then
-          table.insert(result.warnings, {
-            line = i,
-            message = string.format(
-              "Inconsistent column count: expected %d columns, found %d",
-              header_cols,
-              cols
-            ),
-            severity = "warning",
-            error_type = "schema",
-          })
-        end
-      end
-    end
-
-    -- Check for potential encoding issues
-    for i, line in ipairs(lines) do
-      if i > 100 then break end  -- Check first 100 lines
-      if line:match('[\0-\8\11-\12\14-\31]') then
-        table.insert(result.warnings, {
-          line = i,
-          message = "Potential binary or control characters detected",
-          severity = "warning",
-          error_type = "format",
-        })
-      end
-    end
-  end
-
-  result.info = string.format(
-    "CSV with %d lines, %d errors, %d warnings",
-    #lines,
-    #result.errors,
-    #result.warnings
-  )
-
-  return result
-end
-
 ---Validate JSON content
 ---@param content string JSON content
----@param bufnr number Buffer number
 ---@return ValidationResult result
-local function validate_json(content, bufnr)
+local function validate_json(content)
   local result = {
     valid = true,
     errors = {},
@@ -255,26 +264,15 @@ local function validate_json(content, bufnr)
       error_type = "json",
     })
   else
-    -- Validate with DuckDB for schema issues
-    local success, error_msg = try_parse_with_duckdb(content, 'json')
-
-    if not success and error_msg then
-      result.valid = false
-      local parsed_errors = parse_duckdb_error(error_msg, 'json')
-      for _, err in ipairs(parsed_errors) do
-        table.insert(result.errors, err)
-      end
-    end
-
     -- Check if it's an array (expected for querying)
-    if result.valid and type(decode_result) ~= 'table' then
+    if type(decode_result) ~= "table" then
       table.insert(result.warnings, {
         line = 1,
         message = "JSON is not an array - queries may not work as expected",
         severity = "warning",
         error_type = "schema",
       })
-    elseif result.valid and #decode_result == 0 then
+    elseif vim.tbl_islist(decode_result) and #decode_result == 0 then
       table.insert(result.warnings, {
         line = 1,
         message = "JSON array is empty",
@@ -284,39 +282,34 @@ local function validate_json(content, bufnr)
     end
   end
 
-  result.info = string.format(
-    "JSON with %d errors, %d warnings",
-    #result.errors,
-    #result.warnings
-  )
+  result.info = string.format("JSON with %d errors, %d warnings", #result.errors, #result.warnings)
 
   return result
 end
 
----Validate JSONL content
+---Validate JSONL content (newline-delimited JSON)
 ---@param content string JSONL content
----@param bufnr number Buffer number
 ---@return ValidationResult result
-local function validate_jsonl(content, bufnr)
+local function validate_jsonl(content)
   local result = {
     valid = true,
     errors = {},
     warnings = {},
   }
 
-  local lines = vim.split(content, '\n', { plain = true })
+  local lines = vim.split(content, "\n", { plain = true })
   local valid_lines = 0
 
   -- Validate each line
   for i, line in ipairs(lines) do
-    if line:match('%S') then  -- Skip empty lines
+    if line:match("%S") then -- Skip empty lines
       local ok, decode_result = pcall(vim.json.decode, line)
 
       if not ok then
         result.valid = false
         table.insert(result.errors, {
           line = i,
-          message = string.format("Invalid JSON on line %d: %s", i, tostring(decode_result)),
+          message = string.format("Invalid JSON: %s", tostring(decode_result)),
           severity = "error",
           error_type = "json",
         })
@@ -324,7 +317,7 @@ local function validate_jsonl(content, bufnr)
         valid_lines = valid_lines + 1
 
         -- Check if it's an object (expected for JSONL)
-        if type(decode_result) ~= 'table' or #decode_result > 0 then
+        if type(decode_result) ~= "table" or vim.tbl_islist(decode_result) then
           table.insert(result.warnings, {
             line = i,
             message = "Expected JSON object, found " .. type(decode_result),
@@ -345,19 +338,6 @@ local function validate_jsonl(content, bufnr)
     })
   end
 
-  -- Also validate with DuckDB
-  if result.valid then
-    local success, error_msg = try_parse_with_duckdb(content, 'jsonl')
-
-    if not success and error_msg then
-      result.valid = false
-      local parsed_errors = parse_duckdb_error(error_msg, 'jsonl')
-      for _, err in ipairs(parsed_errors) do
-        table.insert(result.errors, err)
-      end
-    end
-  end
-
   result.info = string.format(
     "JSONL with %d lines, %d valid, %d errors, %d warnings",
     #lines,
@@ -368,6 +348,10 @@ local function validate_jsonl(content, bufnr)
 
   return result
 end
+
+-- ============================================================================
+-- Public API
+-- ============================================================================
 
 ---Validate buffer content
 ---@param identifier string|number|nil Buffer identifier
@@ -381,12 +365,26 @@ function M.validate_buffer(identifier)
 
   local result
 
-  if buffer_info.format == 'csv' then
-    result = validate_csv(buffer_info.content, buffer_info.bufnr)
-  elseif buffer_info.format == 'json' then
-    result = validate_json(buffer_info.content, buffer_info.bufnr)
-  elseif buffer_info.format == 'jsonl' then
-    result = validate_jsonl(buffer_info.content, buffer_info.bufnr)
+  if buffer_info.format == "csv" then
+    -- For CSV, we need an actual file path for DuckDB's reject tables
+    -- If buffer has a file, use it; otherwise write to temp file
+    local file_path = buffer_info.name
+    if file_path == "" or not vim.fn.filereadable(file_path) then
+      -- Write buffer content to temp file
+      file_path = string.format("/tmp/duckdb_validate_%d.csv", buffer_info.bufnr)
+      local file = io.open(file_path, "w")
+      if file then
+        file:write(buffer_info.content)
+        file:close()
+      else
+        return nil, "Failed to create temporary file for validation"
+      end
+    end
+    result = validate_csv(file_path)
+  elseif buffer_info.format == "json" then
+    result = validate_json(buffer_info.content)
+  elseif buffer_info.format == "jsonl" then
+    result = validate_jsonl(buffer_info.content)
   else
     return nil, string.format("Unsupported format for validation: %s", buffer_info.format)
   end
@@ -399,66 +397,122 @@ end
 ---@param validation_result ValidationResult Validation result
 function M.set_diagnostics(bufnr, validation_result)
   local diagnostics = {}
+  local namespace = vim.api.nvim_create_namespace("duckdb_validation")
 
-  -- Add errors
+  -- Clear existing diagnostics and autocmds first
+  vim.diagnostic.reset(namespace, bufnr)
+  pcall(vim.api.nvim_del_augroup_by_name, "duckdb_validation_" .. bufnr)
+
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+
+  -- Add errors with line mapping from reject_errors
   for _, err in ipairs(validation_result.errors) do
+    -- Line numbers from reject_errors are 1-based file lines
+    -- Neovim diagnostics use 0-based indexing
+    local lnum = (err.line or 1) - 1
+
+    -- Ensure line number is valid for buffer
+    if lnum >= line_count then
+      lnum = line_count - 1
+    end
+    if lnum < 0 then
+      lnum = 0
+    end
+
+    -- Column from reject_errors is 1-based column index
+    -- Map to character position if possible
+    local col = 0
+    if err.column and err.column > 0 then
+      -- Try to find the column position in the actual line
+      local line_content = vim.api.nvim_buf_get_lines(bufnr, lnum, lnum + 1, false)[1]
+      if line_content then
+        col = find_csv_column_position(line_content, err.column)
+      end
+    end
+
     table.insert(diagnostics, {
       bufnr = bufnr,
-      lnum = (err.line or 1) - 1,  -- 0-indexed
-      col = (err.column or 1) - 1,  -- 0-indexed
+      lnum = lnum,
+      col = col,
       severity = vim.diagnostic.severity.ERROR,
-      source = 'duckdb',
-      message = err.message,
-      user_data = { error_type = err.error_type },
+      source = "duckdb",
+      message = M.sanitize(err.message),
+      user_data = {
+        error_type = err.error_type,
+        csv_line = err.csv_line,
+      },
     })
   end
 
   -- Add warnings
   for _, warn in ipairs(validation_result.warnings) do
+    local lnum = (warn.line or 1) - 1
+    if lnum >= line_count then
+      lnum = line_count - 1
+    end
+    if lnum < 0 then
+      lnum = 0
+    end
+
     table.insert(diagnostics, {
       bufnr = bufnr,
-      lnum = (warn.line or 1) - 1,  -- 0-indexed
-      col = (warn.column or 1) - 1,  -- 0-indexed
+      lnum = lnum,
+      col = (warn.column or 1) - 1,
       severity = vim.diagnostic.severity.WARN,
-      source = 'duckdb',
-      message = warn.message,
+      source = "duckdb",
+      message = M.sanitize(warn.message),
       user_data = { error_type = warn.error_type },
     })
   end
 
-  -- Set diagnostics
-  local namespace = vim.api.nvim_create_namespace('duckdb_validation')
   vim.diagnostic.set(namespace, bufnr, diagnostics, {})
+
+  -- Auto-clear diagnostics when buffer is modified (idiomatic Neovim behavior)
+  local augroup = vim.api.nvim_create_augroup("duckdb_validation_" .. bufnr, { clear = true })
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    group = augroup,
+    buffer = bufnr,
+    once = true,
+    callback = function()
+      M.clear_diagnostics(bufnr)
+    end,
+  })
 end
 
 ---Clear diagnostics for a buffer
 ---@param bufnr number Buffer number
 function M.clear_diagnostics(bufnr)
-  local namespace = vim.api.nvim_create_namespace('duckdb_validation')
+  local namespace = vim.api.nvim_create_namespace("duckdb_validation")
   vim.diagnostic.reset(namespace, bufnr)
+  -- Clean up autocmd group if it exists
+  pcall(vim.api.nvim_del_augroup_by_name, "duckdb_validation_" .. bufnr)
 end
 
----Display validation results in a floating window
+---Sanitize string for display (remove newlines)
+---@param str string Input string
+---@return string Sanitized string
+function M.sanitize(str)
+  if not str then return "" end
+  return str:gsub("\n", " "):gsub("\r", "")
+end
+
+---Display validation results in a floating window with jump-to-error support
 ---@param validation_result ValidationResult Validation result
 ---@param buffer_name string Buffer name for display
 function M.display_validation_results(validation_result, buffer_name)
   local lines = {}
 
   -- Title
-  table.insert(lines, string.format("Validation Results: %s", buffer_name))
-  table.insert(lines, string.rep("═", 60))
+  table.insert(lines, string.format("Validation Results: %s", vim.fn.fnamemodify(buffer_name, ":t")))
+  table.insert(lines, string.rep("=", 70))
   table.insert(lines, "")
 
   -- Summary
   if validation_result.valid and #validation_result.errors == 0 and #validation_result.warnings == 0 then
-    table.insert(lines, "✓ Valid! No errors or warnings found.")
+    table.insert(lines, "Status: VALID - No errors found")
   else
-    if #validation_result.errors > 0 then
-      table.insert(lines, string.format("✗ Errors: %d", #validation_result.errors))
-    end
-    if #validation_result.warnings > 0 then
-      table.insert(lines, string.format("⚠ Warnings: %d", #validation_result.warnings))
-    end
+    table.insert(lines, string.format("Status: INVALID - %d error(s), %d warning(s)",
+      #validation_result.errors, #validation_result.warnings))
   end
 
   if validation_result.info then
@@ -466,65 +520,69 @@ function M.display_validation_results(validation_result, buffer_name)
     table.insert(lines, validation_result.info)
   end
 
-  -- Errors
+  -- Detailed Errors
   if #validation_result.errors > 0 then
     table.insert(lines, "")
     table.insert(lines, "Errors:")
-    table.insert(lines, string.rep("─", 60))
+    table.insert(lines, string.rep("-", 70))
 
     for i, err in ipairs(validation_result.errors) do
-      if i > 20 then  -- Limit display
-        table.insert(lines, string.format("... and %d more errors", #validation_result.errors - 20))
+      if i > 50 then  -- Limit display
+        table.insert(lines, string.format("... and %d more errors", #validation_result.errors - 50))
         break
       end
 
+      -- Error header with line number
       local location = ""
       if err.line then
         location = string.format("Line %d", err.line)
         if err.column then
           location = location .. string.format(", Col %d", err.column)
         end
-        location = location .. ": "
       end
 
-      table.insert(lines, string.format("%d. [%s] %s%s", i, err.error_type, location, err.message))
+      table.insert(lines, "")
+      table.insert(lines, string.format("%d. %s", i, location))
+      table.insert(lines, string.format("   Type: %s", err.error_type or "unknown"))
+      table.insert(lines, string.format("   Message: %s", M.sanitize(err.message)))
+
+      -- Show the problematic CSV line if available
+      if err.csv_line and err.csv_line ~= "" then
+        local display_line = err.csv_line
+        if #display_line > 60 then
+          display_line = display_line:sub(1, 57) .. "..."
+        end
+        table.insert(lines, string.format("   Content: %s", display_line))
+      end
     end
   end
 
-  -- Warnings
+  -- Warnings section
   if #validation_result.warnings > 0 then
     table.insert(lines, "")
     table.insert(lines, "Warnings:")
-    table.insert(lines, string.rep("─", 60))
+    table.insert(lines, string.rep("-", 70))
 
     for i, warn in ipairs(validation_result.warnings) do
-      if i > 20 then  -- Limit display
+      if i > 20 then
         table.insert(lines, string.format("... and %d more warnings", #validation_result.warnings - 20))
         break
       end
 
-      local location = ""
-      if warn.line then
-        location = string.format("Line %d", warn.line)
-        if warn.column then
-          location = location .. string.format(", Col %d", warn.column)
-        end
-        location = location .. ": "
-      end
-
-      table.insert(lines, string.format("%d. [%s] %s%s", i, warn.error_type, location, warn.message))
+      local location = warn.line and string.format("Line %d: ", warn.line) or ""
+      table.insert(lines, string.format("%d. %s%s", i, location, warn.message))
     end
   end
 
   table.insert(lines, "")
-  table.insert(lines, "Press 'q' or <Esc> to close")
+  table.insert(lines, "Press 'q' or <Esc> to close | 'g' to go to first error | <CR> to jump")
 
   -- Create buffer
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.api.nvim_buf_set_option(buf, 'modifiable', false)
-  vim.api.nvim_buf_set_option(buf, 'bufhidden', 'wipe')
-  vim.api.nvim_buf_set_option(buf, 'filetype', 'duckdb-validation')
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "duckdb-validation", { buf = buf })
 
   -- Calculate window size
   local width = math.min(80, vim.o.columns - 4)
@@ -536,48 +594,92 @@ function M.display_validation_results(validation_result, buffer_name)
 
   -- Window options
   local win_opts = {
-    relative = 'editor',
+    relative = "editor",
     width = width,
     height = height,
     row = row,
     col = col,
-    style = 'minimal',
-    border = 'rounded',
-    title = ' DuckDB Validation ',
-    title_pos = 'center',
+    style = "minimal",
+    border = "rounded",
+    title = " DuckDB Validation ",
+    title_pos = "center",
   }
 
   -- Create window
   local win = vim.api.nvim_open_win(buf, true, win_opts)
 
   -- Set window options
-  vim.api.nvim_win_set_option(win, 'wrap', true)
-  vim.api.nvim_win_set_option(win, 'cursorline', true)
+  vim.api.nvim_set_option_value("wrap", true, { win = win })
+  vim.api.nvim_set_option_value("cursorline", true, { win = win })
 
   -- Add syntax highlighting for validation results
   vim.cmd([[
-    syntax match DuckDBValidationError /^.*✗.*$/
-    syntax match DuckDBValidationWarning /^.*⚠.*$/
-    syntax match DuckDBValidationSuccess /^.*✓.*$/
-    syntax match DuckDBValidationLocation /Line \d\+\(, Col \d\+\)\?:/
-    syntax match DuckDBValidationType /\[.*\]/
+    syntax match DuckDBValidationError /Status: INVALID/
+    syntax match DuckDBValidationSuccess /Status: VALID/
+    syntax match DuckDBValidationLocation /Line \d\+\(, Col \d\+\)\?/
+    syntax match DuckDBValidationType /Type: \w\+/
+    syntax match DuckDBValidationNumber /^\s*\d\+\./
 
     highlight DuckDBValidationError guifg=#ff6b6b ctermfg=203
-    highlight DuckDBValidationWarning guifg=#ffd93d ctermfg=221
     highlight DuckDBValidationSuccess guifg=#6bcf7f ctermfg=114
     highlight DuckDBValidationLocation guifg=#74c0fc ctermfg=117
     highlight DuckDBValidationType guifg=#a78bfa ctermfg=141
+    highlight DuckDBValidationNumber guifg=#ffd93d ctermfg=221
   ]])
 
-  -- Key mappings
-  local keymaps = {
-    { 'n', 'q', '<cmd>close<cr>', { buffer = buf, nowait = true, silent = true } },
-    { 'n', '<Esc>', '<cmd>close<cr>', { buffer = buf, nowait = true, silent = true } },
-  }
+  -- Store original window to return to
+  local orig_win = vim.fn.win_getid(vim.fn.winnr('#'))
 
-  for _, keymap in ipairs(keymaps) do
-    vim.keymap.set(keymap[1], keymap[2], keymap[3], keymap[4])
+  -- Key mappings
+  vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, nowait = true, silent = true })
+  vim.keymap.set("n", "<Esc>", "<cmd>close<cr>", { buffer = buf, nowait = true, silent = true })
+
+  -- Jump to first error
+  local first_error = validation_result.errors[1]
+  if first_error and first_error.line then
+    vim.keymap.set("n", "g", function()
+      vim.cmd("close")
+      if vim.api.nvim_win_is_valid(orig_win) then
+        vim.api.nvim_set_current_win(orig_win)
+      end
+      vim.api.nvim_win_set_cursor(0, { first_error.line, (first_error.column or 1) - 1 })
+    end, { buffer = buf, nowait = true, silent = true, desc = "Go to first error" })
   end
+
+  -- Jump to error under cursor (parse error number from line)
+  vim.keymap.set("n", "<CR>", function()
+    local cursor_line = vim.api.nvim_win_get_cursor(win)[1]
+
+    -- Search backwards from cursor for an error number
+    for l = cursor_line, 1, -1 do
+      local content = vim.api.nvim_buf_get_lines(buf, l - 1, l, false)[1]
+      local err_num = content:match("^%s*(%d+)%.")
+      if err_num then
+        local err = validation_result.errors[tonumber(err_num)]
+        if err and err.line then
+          vim.cmd("close")
+          if vim.api.nvim_win_is_valid(orig_win) then
+            vim.api.nvim_set_current_win(orig_win)
+          end
+          vim.api.nvim_win_set_cursor(0, { err.line, (err.column or 1) - 1 })
+          return
+        end
+      end
+    end
+    -- No error found under cursor
+    vim.notify("No error found at cursor position", vim.log.levels.INFO)
+  end, { buffer = buf, nowait = true, silent = true, desc = "Go to error under cursor" })
+
+  -- Auto-close floating window when leaving buffer
+  vim.api.nvim_create_autocmd("BufLeave", {
+    buffer = buf,
+    once = true,
+    callback = function()
+      if vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_close(win, true)
+      end
+    end,
+  })
 end
 
 return M

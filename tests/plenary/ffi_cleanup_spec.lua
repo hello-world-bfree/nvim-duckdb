@@ -190,11 +190,13 @@ describe('DuckDB FFI Cleanup', function()
       local conn, err = query_module.create_connection()
       assert.is_nil(err)
 
+      -- Use explicit casts to ensure predictable types
+      -- (DuckDB infers 3.14 as DECIMAL, not FLOAT/DOUBLE)
       local sql = [[
         SELECT
           true as bool_val,
-          42 as int_val,
-          3.14 as float_val,
+          42::INTEGER as int_val,
+          3.14::DOUBLE as float_val,
           'hello world' as str_val,
           NULL as null_val
       ]]
@@ -210,6 +212,7 @@ describe('DuckDB FFI Cleanup', function()
       assert.is_not_nil(row)
       assert.equals(true, row[1])  -- bool
       assert.equals(42, row[2])    -- int
+      assert.is_number(row[3])     -- double
       assert.is_true(math.abs(row[3] - 3.14) < 0.001)  -- float
       assert.equals('hello world', row[4])  -- string
       assert.is_nil(row[5])  -- null

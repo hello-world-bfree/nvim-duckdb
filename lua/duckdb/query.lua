@@ -1,9 +1,12 @@
 ---@class DuckDBQuery
 local M = {}
 
-local ffi = require('ffi')
-local duckdb_ffi = require('duckdb.ffi')
-local buffer_module = require('duckdb.buffer')
+local ffi = require("ffi")
+local duckdb_ffi = require("duckdb.ffi")
+local buffer_module = require("duckdb.buffer")
+
+-- Type constants for cleaner code
+local T = duckdb_ffi.types
 
 ---@class DuckDBConnection
 ---@field db ffi.cdata* Database handle
@@ -17,6 +20,182 @@ local buffer_module = require('duckdb.buffer')
 ---@field row_count number Number of rows
 ---@field column_count number Number of columns
 ---@field rows_changed number Number of rows affected (for DML)
+
+-- ============================================================================
+-- Type Formatting Helpers
+-- ============================================================================
+
+---Format timestamp (microseconds since epoch) to ISO string
+---@param micros number Microseconds since epoch
+---@return string
+local function format_timestamp(micros)
+  local seconds = math.floor(micros / 1000000)
+  local us = micros % 1000000
+  if us < 0 then
+    us = us + 1000000
+    seconds = seconds - 1
+  end
+  return os.date("!%Y-%m-%d %H:%M:%S", seconds) .. string.format(".%06d", us)
+end
+
+---Format date (days since epoch) to ISO string
+---@param days number Days since 1970-01-01
+---@return string
+local function format_date(days)
+  local seconds = days * 86400
+  return os.date("!%Y-%m-%d", seconds)
+end
+
+---Format time (microseconds since midnight) to string
+---@param micros number Microseconds since midnight
+---@return string
+local function format_time(micros)
+  local total_seconds = math.floor(micros / 1000000)
+  local us = micros % 1000000
+  local hours = math.floor(total_seconds / 3600)
+  local minutes = math.floor((total_seconds % 3600) / 60)
+  local seconds = total_seconds % 60
+  return string.format("%02d:%02d:%02d.%06d", hours, minutes, seconds, us)
+end
+
+---Format hugeint (128-bit signed integer) to string
+---@param hugeint ffi.cdata* duckdb_hugeint structure
+---@return string
+local function format_hugeint(hugeint)
+  local upper = tonumber(hugeint.upper)
+  local lower = tonumber(hugeint.lower)
+
+  if upper == 0 then
+    return tostring(lower)
+  elseif upper == -1 and lower >= 0x8000000000000000ULL then
+    -- Small negative number
+    return tostring(lower - 0x10000000000000000)
+  else
+    -- Large number - show approximation
+    return string.format("%d*2^64+%u", upper, lower)
+  end
+end
+
+---Format interval to string
+---@param interval ffi.cdata* duckdb_interval structure
+---@return string
+local function format_interval(interval)
+  local parts = {}
+  if interval.months ~= 0 then
+    table.insert(parts, string.format("%d months", interval.months))
+  end
+  if interval.days ~= 0 then
+    table.insert(parts, string.format("%d days", interval.days))
+  end
+  if interval.micros ~= 0 then
+    local total_seconds = math.floor(interval.micros / 1000000)
+    local hours = math.floor(total_seconds / 3600)
+    local minutes = math.floor((total_seconds % 3600) / 60)
+    local seconds = total_seconds % 60
+    table.insert(parts, string.format("%02d:%02d:%02d", hours, minutes, seconds))
+  end
+  return #parts > 0 and table.concat(parts, " ") or "0"
+end
+
+-- ============================================================================
+-- Vector Value Extraction (Modern API)
+-- ============================================================================
+
+---Extract a single value from a vector at a given row index
+---@param vector ffi.cdata* Vector handle
+---@param col_type number Column type enum value
+---@param row number Row index within chunk (0-based)
+---@param validity ffi.cdata*? Validity mask (nil if no NULLs in column)
+---@return any value
+local function extract_vector_value(vector, col_type, row, validity)
+  -- Check NULL via validity mask
+  if validity ~= nil and not duckdb_ffi.C.duckdb_validity_row_is_valid(validity, row) then
+    return nil
+  end
+
+  local data = duckdb_ffi.C.duckdb_vector_get_data(vector)
+  if data == nil then
+    return nil
+  end
+
+  -- Type-specific extraction using ffi.cast
+  if col_type == T.BOOLEAN then
+    local bool_data = ffi.cast("bool*", data)
+    return bool_data[row]
+  elseif col_type == T.TINYINT then
+    local int8_data = ffi.cast("int8_t*", data)
+    return tonumber(int8_data[row])
+  elseif col_type == T.SMALLINT then
+    local int16_data = ffi.cast("int16_t*", data)
+    return tonumber(int16_data[row])
+  elseif col_type == T.INTEGER then
+    local int32_data = ffi.cast("int32_t*", data)
+    return tonumber(int32_data[row])
+  elseif col_type == T.BIGINT then
+    local int64_data = ffi.cast("int64_t*", data)
+    return tonumber(int64_data[row])
+  elseif col_type == T.UTINYINT then
+    local uint8_data = ffi.cast("uint8_t*", data)
+    return tonumber(uint8_data[row])
+  elseif col_type == T.USMALLINT then
+    local uint16_data = ffi.cast("uint16_t*", data)
+    return tonumber(uint16_data[row])
+  elseif col_type == T.UINTEGER then
+    local uint32_data = ffi.cast("uint32_t*", data)
+    return tonumber(uint32_data[row])
+  elseif col_type == T.UBIGINT then
+    local uint64_data = ffi.cast("uint64_t*", data)
+    return tonumber(uint64_data[row])
+  elseif col_type == T.FLOAT then
+    local float_data = ffi.cast("float*", data)
+    return tonumber(float_data[row])
+  elseif col_type == T.DOUBLE then
+    local double_data = ffi.cast("double*", data)
+    return tonumber(double_data[row])
+  elseif col_type == T.VARCHAR or col_type == T.BLOB then
+    local str_data = ffi.cast("duckdb_string_t*", data)
+    return duckdb_ffi.extract_string(str_data + row)
+  elseif col_type == T.TIMESTAMP or col_type == T.TIMESTAMP_S or col_type == T.TIMESTAMP_MS or col_type == T.TIMESTAMP_NS or col_type == T.TIMESTAMP_TZ then
+    local ts_data = ffi.cast("duckdb_timestamp*", data)
+    return format_timestamp(tonumber(ts_data[row].micros))
+  elseif col_type == T.DATE then
+    local date_data = ffi.cast("duckdb_date*", data)
+    return format_date(tonumber(date_data[row].days))
+  elseif col_type == T.TIME or col_type == T.TIME_TZ then
+    local time_data = ffi.cast("duckdb_time*", data)
+    return format_time(tonumber(time_data[row].micros))
+  elseif col_type == T.INTERVAL then
+    local interval_data = ffi.cast("duckdb_interval*", data)
+    return format_interval(interval_data + row)
+  elseif col_type == T.HUGEINT then
+    local hugeint_data = ffi.cast("duckdb_hugeint*", data)
+    return format_hugeint(hugeint_data + row)
+  elseif col_type == T.UHUGEINT then
+    local uhugeint_data = ffi.cast("duckdb_uhugeint*", data)
+    -- Simple representation for unsigned 128-bit
+    local upper = tonumber(uhugeint_data[row].upper)
+    local lower = tonumber(uhugeint_data[row].lower)
+    if upper == 0 then
+      return tostring(lower)
+    else
+      return string.format("%u*2^64+%u", upper, lower)
+    end
+  elseif col_type == T.UUID then
+    -- UUID is stored as hugeint, format as UUID string
+    local uuid_data = ffi.cast("duckdb_hugeint*", data)
+    local upper = uuid_data[row].upper
+    local lower = uuid_data[row].lower
+    -- Format as UUID (simplified)
+    return string.format("%016x%016x", tonumber(upper), tonumber(lower))
+  else
+    -- For unsupported types (LIST, STRUCT, MAP, ENUM, etc.), return type name
+    return string.format("[%s]", duckdb_ffi.type_names[col_type] or "UNKNOWN")
+  end
+end
+
+-- ============================================================================
+-- Connection Management
+-- ============================================================================
 
 ---Create a new DuckDB connection
 ---@return DuckDBConnection? connection
@@ -75,7 +254,11 @@ function M.close_connection(connection)
   end
 end
 
----Execute a query and return results
+-- ============================================================================
+-- Query Execution (Modern Data Chunk API)
+-- ============================================================================
+
+---Execute a query and return results using modern data chunk API
 ---@param connection DuckDBConnection
 ---@param query string SQL query
 ---@return QueryResult? result
@@ -95,7 +278,6 @@ function M.execute_query(connection, query)
 
   if state ~= 0 then
     local error_msg = "Query failed"
-    -- Use modern accessor function instead of direct struct access
     local err_ptr = duckdb_ffi.C.duckdb_result_error(result)
     if err_ptr ~= nil then
       error_msg = ffi.string(err_ptr)
@@ -106,10 +288,10 @@ function M.execute_query(connection, query)
 
   -- Extract column information
   local column_count = tonumber(duckdb_ffi.C.duckdb_column_count(result))
-  local row_count = tonumber(duckdb_ffi.C.duckdb_row_count(result))
   local rows_changed = tonumber(duckdb_ffi.C.duckdb_rows_changed(result))
 
   local columns = {}
+  local column_types = {}
   for col = 0, column_count - 1 do
     local col_name = duckdb_ffi.C.duckdb_column_name(result, col)
     if col_name ~= nil then
@@ -117,17 +299,49 @@ function M.execute_query(connection, query)
     else
       table.insert(columns, string.format("column_%d", col))
     end
+    table.insert(column_types, tonumber(duckdb_ffi.C.duckdb_column_type(result, col)))
   end
 
-  -- Extract row data
+  -- Extract row data using data chunks (modern API)
   local rows = {}
-  for row = 0, row_count - 1 do
-    local row_data = {}
-    for col = 0, column_count - 1 do
-      local value = M.get_value(result, col, row)
-      table.insert(row_data, value)
+  local total_row_count = 0
+
+  -- Fetch chunks until exhausted
+  while true do
+    local chunk = duckdb_ffi.C.duckdb_fetch_chunk(result[0])
+    if chunk == nil then
+      break
     end
-    table.insert(rows, row_data)
+
+    local chunk_size = tonumber(duckdb_ffi.C.duckdb_data_chunk_get_size(chunk))
+    total_row_count = total_row_count + chunk_size
+
+    -- Cache vectors and validity masks for this chunk
+    local vectors = {}
+    local validities = {}
+    for col = 0, column_count - 1 do
+      vectors[col] = duckdb_ffi.C.duckdb_data_chunk_get_vector(chunk, col)
+      validities[col] = duckdb_ffi.C.duckdb_vector_get_validity(vectors[col])
+    end
+
+    -- Extract rows from this chunk
+    for row = 0, chunk_size - 1 do
+      local row_data = {}
+      for col = 0, column_count - 1 do
+        local value = extract_vector_value(
+          vectors[col],
+          column_types[col + 1],
+          row,
+          validities[col]
+        )
+        table.insert(row_data, value)
+      end
+      table.insert(rows, row_data)
+    end
+
+    -- Destroy chunk after processing
+    local chunk_ptr = ffi.new("duckdb_data_chunk[1]", chunk)
+    duckdb_ffi.C.duckdb_destroy_data_chunk(chunk_ptr)
   end
 
   duckdb_ffi.C.duckdb_destroy_result(result)
@@ -135,67 +349,15 @@ function M.execute_query(connection, query)
   return {
     columns = columns,
     rows = rows,
-    row_count = row_count,
+    row_count = total_row_count,
     column_count = column_count,
     rows_changed = rows_changed,
   }
 end
 
----Get value from result set
----@param result ffi.cdata*
----@param col number Column index
----@param row number Row index
----@return any value
-function M.get_value(result, col, row)
-  -- Check if value is null
-  if duckdb_ffi.C.duckdb_value_is_null(result, col, row) then
-    return nil
-  end
-
-  local col_type = duckdb_ffi.C.duckdb_column_type(result, col)
-
-  -- Handle different types
-  if col_type == 1 then -- BOOLEAN
-    return duckdb_ffi.C.duckdb_value_boolean(result, col, row)
-  elseif col_type == 2 then -- TINYINT
-    return tonumber(duckdb_ffi.C.duckdb_value_int8(result, col, row))
-  elseif col_type == 3 then -- SMALLINT
-    return tonumber(duckdb_ffi.C.duckdb_value_int16(result, col, row))
-  elseif col_type == 4 then -- INTEGER
-    return tonumber(duckdb_ffi.C.duckdb_value_int32(result, col, row))
-  elseif col_type == 5 then -- BIGINT
-    return tonumber(duckdb_ffi.C.duckdb_value_int64(result, col, row))
-  elseif col_type == 6 then -- UTINYINT
-    return tonumber(duckdb_ffi.C.duckdb_value_uint8(result, col, row))
-  elseif col_type == 7 then -- USMALLINT
-    return tonumber(duckdb_ffi.C.duckdb_value_uint16(result, col, row))
-  elseif col_type == 8 then -- UINTEGER
-    return tonumber(duckdb_ffi.C.duckdb_value_uint32(result, col, row))
-  elseif col_type == 9 then -- UBIGINT
-    return tonumber(duckdb_ffi.C.duckdb_value_uint64(result, col, row))
-  elseif col_type == 10 then -- FLOAT
-    return tonumber(duckdb_ffi.C.duckdb_value_float(result, col, row))
-  elseif col_type == 11 then -- DOUBLE
-    return tonumber(duckdb_ffi.C.duckdb_value_double(result, col, row))
-  elseif col_type == 17 or col_type == 28 then -- VARCHAR or JSON
-    local str_ptr = duckdb_ffi.C.duckdb_value_varchar(result, col, row)
-    if str_ptr ~= nil then
-      local str = ffi.string(str_ptr)
-      duckdb_ffi.C.duckdb_free(str_ptr)
-      return str
-    end
-    return ""
-  else
-    -- For other types, try to get as varchar
-    local str_ptr = duckdb_ffi.C.duckdb_value_varchar(result, col, row)
-    if str_ptr ~= nil then
-      local str = ffi.string(str_ptr)
-      duckdb_ffi.C.duckdb_free(str_ptr)
-      return str
-    end
-    return nil
-  end
-end
+-- ============================================================================
+-- Buffer Data Loading
+-- ============================================================================
 
 ---Load buffer data into a table
 ---@param connection DuckDBConnection
@@ -206,39 +368,46 @@ end
 function M.load_buffer_data(connection, table_name, buffer_info)
   local create_query
 
-  if buffer_info.format == 'csv' then
+  if buffer_info.format == "csv" then
     -- Escape single quotes in content
     local escaped_content = buffer_info.content:gsub("'", "''")
 
     -- Use DuckDB's read_csv_auto to auto-detect schema
-    create_query = string.format(
-      "CREATE TEMPORARY TABLE %s AS SELECT * FROM read_csv_auto('%s')",
-      table_name,
-      '/dev/stdin'
-    )
+    vim.system({
+      "sh",
+      "-c",
+      string.format("echo '%s' > /tmp/%s.csv", escaped_content, table_name),
+    }, { text = true }):wait()
 
-    -- Alternative: use inline CSV data
-    -- DuckDB supports reading from string values
-    create_query = string.format(
-      "CREATE TEMPORARY TABLE %s AS SELECT * FROM read_csv_auto(%s, sample_size=-1)",
-      table_name,
-      vim.inspect(buffer_info.content)
-    )
+    create_query =
+      string.format("create temp table %s as select * from read_csv('/tmp/%s.csv')", table_name, table_name)
+  elseif buffer_info.format == "json" then
+    -- Write JSON to temp file (same pattern as CSV)
+    local escaped_content = buffer_info.content:gsub("'", "'\\''")
+    vim.system({
+      "sh",
+      "-c",
+      string.format("printf '%%s' '%s' > /tmp/%s.json", escaped_content, table_name),
+    }, { text = true }):wait()
 
-  elseif buffer_info.format == 'json' then
-    -- Use DuckDB's read_json_auto
     create_query = string.format(
-      "CREATE TEMPORARY TABLE %s AS SELECT * FROM read_json_auto(%s)",
+      "CREATE TEMP TABLE %s AS SELECT * FROM read_json('/tmp/%s.json')",
       table_name,
-      vim.inspect(buffer_info.content)
+      table_name
     )
+  elseif buffer_info.format == "jsonl" then
+    -- Write JSONL to temp file
+    local escaped_content = buffer_info.content:gsub("'", "'\\''")
+    vim.system({
+      "sh",
+      "-c",
+      string.format("printf '%%s' '%s' > /tmp/%s.jsonl", escaped_content, table_name),
+    }, { text = true }):wait()
 
-  elseif buffer_info.format == 'jsonl' then
-    -- Use DuckDB's read_json_auto with format='newline_delimited'
     create_query = string.format(
-      "CREATE TEMPORARY TABLE %s AS SELECT * FROM read_json_auto(%s, format='newline_delimited')",
+      "CREATE TEMP TABLE %s AS SELECT * FROM read_json('/tmp/%s.jsonl', format='newline_delimited')",
       table_name,
-      vim.inspect(buffer_info.content)
+      table_name
     )
   else
     return false, string.format("Unsupported format: %s", buffer_info.format)
@@ -251,6 +420,10 @@ function M.load_buffer_data(connection, table_name, buffer_info)
 
   return true
 end
+
+-- ============================================================================
+-- Buffer Query Execution
+-- ============================================================================
 
 ---Execute query on buffer(s)
 ---@param query string SQL query
@@ -290,11 +463,11 @@ function M.query_buffer(query, buffer_identifier)
 
       -- Generate table name
       local table_name
-      if type(id) == 'string' then
-        table_name = id:gsub('[^%w_]', '_')
+      if type(id) == "string" then
+        table_name = id:gsub("[^%w_]", "_")
       else
-        local basename = vim.fn.fnamemodify(buffer_info.name, ':t:r')
-        table_name = basename ~= '' and basename or 'buffer'
+        local basename = vim.fn.fnamemodify(buffer_info.name, ":t:r")
+        table_name = basename ~= "" and basename or "buffer"
       end
 
       -- Load buffer data
@@ -311,16 +484,11 @@ function M.query_buffer(query, buffer_identifier)
     for i, id in ipairs(identifiers) do
       local table_name = loaded_tables[i]
       -- Replace buffer('name') or buffer(num) with table name
-      if type(id) == 'string' then
-        processed_query = processed_query:gsub(
-          "buffer%s*%(%s*['\"]" .. id:gsub("[%-%.]", "%%%1") .. "['\"]%s*%)",
-          table_name
-        )
+      if type(id) == "string" then
+        processed_query =
+          processed_query:gsub("buffer%s*%(%s*['\"]" .. id:gsub("[%-%.]", "%%%1") .. "['\"]%s*%)", table_name)
       else
-        processed_query = processed_query:gsub(
-          "buffer%s*%(%s*" .. id .. "%s*%)",
-          table_name
-        )
+        processed_query = processed_query:gsub("buffer%s*%(%s*" .. id .. "%s*%)", table_name)
       end
     end
 

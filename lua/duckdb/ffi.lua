@@ -7,13 +7,13 @@ local ffi = require('ffi')
 -- Guard against multiple ffi.cdef calls (LuaJIT doesn't allow redefining types)
 -- This is necessary for test environments that reload modules
 if not pcall(ffi.typeof, 'duckdb_database') then
-  -- DuckDB C API declarations
+  -- DuckDB C API declarations (Modern API - Nov 2025)
   -- Source: https://github.com/duckdb/duckdb/blob/main/src/include/duckdb.h
   ffi.cdef[[
     // Basic type definitions
     typedef uint64_t idx_t;
 
-    // Type enumeration
+    // Type enumeration (complete as of Nov 2025)
     typedef enum {
       DUCKDB_TYPE_INVALID = 0,
       DUCKDB_TYPE_BOOLEAN = 1,
@@ -47,6 +47,11 @@ if not pcall(ffi.typeof, 'duckdb_database') then
       DUCKDB_TYPE_BIT = 29,
       DUCKDB_TYPE_TIME_TZ = 30,
       DUCKDB_TYPE_TIMESTAMP_TZ = 31,
+      DUCKDB_TYPE_UHUGEINT = 32,
+      DUCKDB_TYPE_ARRAY = 33,
+      DUCKDB_TYPE_ANY = 34,
+      DUCKDB_TYPE_VARINT = 35,
+      DUCKDB_TYPE_SQLNULL = 36,
     } duckdb_type;
 
     typedef enum {
@@ -54,14 +59,37 @@ if not pcall(ffi.typeof, 'duckdb_database') then
       DuckDBError = 1
     } duckdb_state;
 
-    // Database and connection are pointers to opaque structs
-    typedef struct _duckdb_database {
-      void *internal_ptr;
-    } *duckdb_database;
+    // Opaque handle types (modern API uses void*)
+    typedef void *duckdb_database;
+    typedef void *duckdb_connection;
+    typedef void *duckdb_data_chunk;
+    typedef void *duckdb_vector;
+    typedef void *duckdb_logical_type;
+    typedef void *duckdb_prepared_statement;
 
-    typedef struct _duckdb_connection {
-      void *internal_ptr;
-    } *duckdb_connection;
+    // String structure with inline optimization
+    // Strings <= 12 bytes are stored inline, larger ones use pointer
+    typedef struct {
+      union {
+        struct {
+          uint32_t length;
+          char prefix[4];
+          char *ptr;
+        } pointer;
+        struct {
+          uint32_t length;
+          char inlined[12];
+        } inlined;
+      } value;
+    } duckdb_string_t;
+
+    // Date/time structures
+    typedef struct { int32_t days; } duckdb_date;
+    typedef struct { int64_t micros; } duckdb_time;
+    typedef struct { int64_t micros; } duckdb_timestamp;
+    typedef struct { int32_t months; int32_t days; int64_t micros; } duckdb_interval;
+    typedef struct { uint64_t lower; int64_t upper; } duckdb_hugeint;
+    typedef struct { uint64_t lower; uint64_t upper; } duckdb_uhugeint;
 
     // Result struct - use accessor functions, not direct field access
     typedef struct {
@@ -86,35 +114,37 @@ if not pcall(ffi.typeof, 'duckdb_database') then
     duckdb_state duckdb_query(duckdb_connection connection, const char* query, duckdb_result* out_result);
     void duckdb_destroy_result(duckdb_result* result);
 
-    // Result error handling (modern API - use these instead of direct struct access)
+    // Result error handling
     const char* duckdb_result_error(duckdb_result* result);
 
-    // Result accessors
+    // Result metadata accessors
     const char* duckdb_column_name(duckdb_result* result, idx_t col);
     duckdb_type duckdb_column_type(duckdb_result* result, idx_t col);
+    duckdb_logical_type duckdb_column_logical_type(duckdb_result* result, idx_t col);
     idx_t duckdb_column_count(duckdb_result* result);
     idx_t duckdb_row_count(duckdb_result* result);
     idx_t duckdb_rows_changed(duckdb_result* result);
 
-    // Value accessors (return allocated memory that must be freed with duckdb_free)
-    bool duckdb_value_boolean(duckdb_result* result, idx_t col, idx_t row);
-    int8_t duckdb_value_int8(duckdb_result* result, idx_t col, idx_t row);
-    int16_t duckdb_value_int16(duckdb_result* result, idx_t col, idx_t row);
-    int32_t duckdb_value_int32(duckdb_result* result, idx_t col, idx_t row);
-    int64_t duckdb_value_int64(duckdb_result* result, idx_t col, idx_t row);
-    uint8_t duckdb_value_uint8(duckdb_result* result, idx_t col, idx_t row);
-    uint16_t duckdb_value_uint16(duckdb_result* result, idx_t col, idx_t row);
-    uint32_t duckdb_value_uint32(duckdb_result* result, idx_t col, idx_t row);
-    uint64_t duckdb_value_uint64(duckdb_result* result, idx_t col, idx_t row);
-    float duckdb_value_float(duckdb_result* result, idx_t col, idx_t row);
-    double duckdb_value_double(duckdb_result* result, idx_t col, idx_t row);
-    char* duckdb_value_varchar(duckdb_result* result, idx_t col, idx_t row);
-    bool duckdb_value_is_null(duckdb_result* result, idx_t col, idx_t row);
+    // Data Chunk API (modern approach for reading results)
+    duckdb_data_chunk duckdb_fetch_chunk(duckdb_result result);
+    idx_t duckdb_data_chunk_get_size(duckdb_data_chunk chunk);
+    idx_t duckdb_data_chunk_get_column_count(duckdb_data_chunk chunk);
+    duckdb_vector duckdb_data_chunk_get_vector(duckdb_data_chunk chunk, idx_t col_idx);
+    void duckdb_destroy_data_chunk(duckdb_data_chunk *chunk);
+
+    // Vector API (column data access)
+    void *duckdb_vector_get_data(duckdb_vector vector);
+    uint64_t *duckdb_vector_get_validity(duckdb_vector vector);
+    duckdb_logical_type duckdb_vector_get_column_type(duckdb_vector vector);
+
+    // Validity mask operations
+    bool duckdb_validity_row_is_valid(uint64_t *validity, idx_t row);
+
+    // Logical type operations
+    duckdb_type duckdb_get_type_id(duckdb_logical_type type);
+    void duckdb_destroy_logical_type(duckdb_logical_type *type);
 
     // Prepared statements
-    typedef struct _duckdb_prepared_statement {
-      void *internal_ptr;
-    } *duckdb_prepared_statement;
     duckdb_state duckdb_prepare(duckdb_connection connection, const char* query, duckdb_prepared_statement* out_prepared_statement);
     void duckdb_destroy_prepare(duckdb_prepared_statement* prepared_statement);
     duckdb_state duckdb_bind_boolean(duckdb_prepared_statement prepared_statement, idx_t param_idx, bool val);
@@ -170,7 +200,7 @@ function M.is_available()
   return false, "DuckDB library not found. Please install libduckdb."
 end
 
----Type name mapping
+---Type name mapping (complete as of Nov 2025)
 M.type_names = {
   [0] = "INVALID",
   [1] = "BOOLEAN",
@@ -200,7 +230,71 @@ M.type_names = {
   [25] = "STRUCT",
   [26] = "MAP",
   [27] = "UUID",
-  [28] = "JSON",
+  [28] = "UNION",
+  [29] = "BIT",
+  [30] = "TIME_TZ",
+  [31] = "TIMESTAMP_TZ",
+  [32] = "UHUGEINT",
+  [33] = "ARRAY",
+  [34] = "ANY",
+  [35] = "VARINT",
+  [36] = "SQLNULL",
 }
+
+---Type constants for cleaner code
+M.types = {
+  INVALID = 0,
+  BOOLEAN = 1,
+  TINYINT = 2,
+  SMALLINT = 3,
+  INTEGER = 4,
+  BIGINT = 5,
+  UTINYINT = 6,
+  USMALLINT = 7,
+  UINTEGER = 8,
+  UBIGINT = 9,
+  FLOAT = 10,
+  DOUBLE = 11,
+  TIMESTAMP = 12,
+  DATE = 13,
+  TIME = 14,
+  INTERVAL = 15,
+  HUGEINT = 16,
+  VARCHAR = 17,
+  BLOB = 18,
+  DECIMAL = 19,
+  TIMESTAMP_S = 20,
+  TIMESTAMP_MS = 21,
+  TIMESTAMP_NS = 22,
+  ENUM = 23,
+  LIST = 24,
+  STRUCT = 25,
+  MAP = 26,
+  UUID = 27,
+  UNION = 28,
+  BIT = 29,
+  TIME_TZ = 30,
+  TIMESTAMP_TZ = 31,
+  UHUGEINT = 32,
+  ARRAY = 33,
+  ANY = 34,
+  VARINT = 35,
+  SQLNULL = 36,
+}
+
+---Extract string from duckdb_string_t structure
+---Handles both inline (<=12 bytes) and pointer-based storage
+---@param str_ptr ffi.cdata* Pointer to duckdb_string_t
+---@return string
+function M.extract_string(str_ptr)
+  local len = str_ptr.value.inlined.length
+  if len <= 12 then
+    -- Inline string (not null-terminated, use explicit length)
+    return ffi.string(str_ptr.value.inlined.inlined, len)
+  else
+    -- Pointer-based string
+    return ffi.string(str_ptr.value.pointer.ptr, str_ptr.value.pointer.length)
+  end
+end
 
 return M
