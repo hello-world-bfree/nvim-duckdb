@@ -1,4 +1,8 @@
-# DuckDB.nvim
+<div align="center">
+  <img src="assets/logo.png" alt="nvim-duckdb - DuckDB integration for Neovim" width="400">
+</div>
+
+# nvim-duckdb
 
 A Neovim plugin that integrates DuckDB via LuaJIT FFI to enable SQL queries on CSV and JSON files directly from buffers.
 
