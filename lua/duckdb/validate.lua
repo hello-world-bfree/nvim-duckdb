@@ -41,7 +41,6 @@ local function find_csv_column_position(line, column_num)
     return 0
   end
 
-  local pos = 0
   local col_count = 1
   local in_quotes = false
 
@@ -55,7 +54,6 @@ local function find_csv_column_position(line, column_num)
         return i -- Position after the comma
       end
     end
-    pos = i
   end
 
   return 0
@@ -92,9 +90,9 @@ local function try_parse_csv_with_rejects(file_path)
     ]], escaped_path)
 
     -- Execute the read (this populates reject tables even if it succeeds)
-    local _, query_err = query_module.execute_query(conn, read_query)
+    local _ = query_module.execute_query(conn, read_query)
 
-    -- Query errors is expected if CSV is malformed - we continue to check reject tables
+    -- Query errors are expected if CSV is malformed - we continue to check reject tables
 
     -- Query reject_errors table for detailed error information
     local reject_result = query_module.execute_query(conn, [[
@@ -202,40 +200,6 @@ end
 -- ============================================================================
 -- JSON Validation
 -- ============================================================================
-
----Parse DuckDB error message to extract line/column information
----@param error_msg string Error message from DuckDB
----@return table<ValidationError> errors
-local function parse_duckdb_error(error_msg)
-  local errors = {}
-
-  local line_num = nil
-  local col_num = nil
-
-  -- Try to extract line/column numbers from error message
-  line_num = error_msg:match("line (%d+)") or error_msg:match("Line: (%d+)")
-  col_num = error_msg:match("column (%d+)") or error_msg:match("position (%d+)")
-
-  -- Determine error type based on message content
-  local error_type = "parse"
-  if error_msg:match("[Tt]ype") or error_msg:match("[Cc]onversion") then
-    error_type = "type"
-  elseif error_msg:match("[Ss]chema") or error_msg:match("[Cc]olumn") then
-    error_type = "schema"
-  elseif error_msg:match("JSON") or error_msg:match("json") then
-    error_type = "json"
-  end
-
-  table.insert(errors, {
-    line = line_num and tonumber(line_num) or nil,
-    column = col_num and tonumber(col_num) or nil,
-    message = error_msg,
-    severity = "error",
-    error_type = error_type,
-  })
-
-  return errors
-end
 
 ---Validate JSON content
 ---@param content string JSON content

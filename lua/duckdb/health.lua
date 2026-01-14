@@ -110,7 +110,7 @@ local function test_csv_parsing()
     return false
   end
 
-  local conn, err = query_module.create_connection()
+  local conn = query_module.create_connection()
   if not conn then
     health.warn('Cannot test CSV parsing: connection failed')
     return false
@@ -142,7 +142,7 @@ local function test_json_parsing()
     return false
   end
 
-  local conn, err = query_module.create_connection()
+  local conn = query_module.create_connection()
   if not conn then
     health.warn('Cannot test JSON parsing: connection failed')
     return false
