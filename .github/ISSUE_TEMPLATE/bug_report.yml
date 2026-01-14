@@ -1,0 +1,95 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the information below to help us investigate.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug
+      placeholder: Describe what went wrong...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the issue
+      placeholder: |
+        1. Open a CSV file with...
+        2. Run :DuckDB SELECT...
+        3. See error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen
+      placeholder: The query should return...
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened
+      placeholder: Instead, I got an error...
+    validations:
+      required: true
+
+  - type: input
+    id: neovim-version
+    attributes:
+      label: Neovim Version
+      description: Output of `:version` or `nvim --version`
+      placeholder: "NVIM v0.11.0"
+    validations:
+      required: true
+
+  - type: input
+    id: duckdb-version
+    attributes:
+      label: DuckDB Version
+      description: Version of libduckdb installed (e.g., from `brew info duckdb`)
+      placeholder: "v1.4.2"
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: "macOS 14.1 / Ubuntu 22.04"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error Messages
+      description: Relevant logs or error messages
+      render: shell
+      placeholder: |
+        Paste any error messages here...
+
+  - type: checkboxes
+    id: health-check
+    attributes:
+      label: Health Check
+      description: Have you run `:checkhealth duckdb`?
+      options:
+        - label: "Yes, I've run `:checkhealth duckdb` and reviewed the output"
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other context about the problem
+      placeholder: Sample CSV file, screenshots, etc...

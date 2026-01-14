@@ -12,6 +12,7 @@ local T = duckdb_ffi.types
 ---@field db ffi.cdata* Database handle
 ---@field conn ffi.cdata* Connection handle
 ---@field temp_dir string? Temporary directory for data files
+---@field temp_files table<string> List of temporary files to clean up
 ---@field _closed boolean Whether the connection has been closed
 
 ---@class QueryResult
@@ -227,13 +228,14 @@ function M.create_connection()
   local connection = {
     db = db,
     conn = conn,
+    temp_files = {},
     _closed = false,
   }
 
   return connection
 end
 
----Close DuckDB connection
+---Close DuckDB connection and clean up temp files
 ---@param connection DuckDBConnection
 function M.close_connection(connection)
   -- Prevent double-close which can cause crashes
@@ -241,6 +243,14 @@ function M.close_connection(connection)
     return
   end
   connection._closed = true
+
+  -- Clean up temporary files
+  if connection.temp_files then
+    for _, filepath in ipairs(connection.temp_files) do
+      pcall(os.remove, filepath)
+    end
+    connection.temp_files = {}
+  end
 
   -- Important: Disconnect connection BEFORE closing database
   -- Wrong order can cause use-after-free crashes
@@ -356,6 +366,34 @@ function M.execute_query(connection, query)
 end
 
 -- ============================================================================
+-- Temp File Management
+-- ============================================================================
+
+---Write content to a temporary file with proper error handling
+---@param content string Content to write
+---@param extension string File extension (e.g., ".csv", ".json")
+---@return string? filepath
+---@return string? error
+local function write_temp_file(content, extension)
+  local temp_path = vim.fn.tempname() .. extension
+
+  local file, err = io.open(temp_path, "w")
+  if not file then
+    return nil, "Failed to create temp file: " .. (err or "unknown error")
+  end
+
+  local success, write_err = pcall(file.write, file, content)
+  file:close()
+
+  if not success then
+    pcall(os.remove, temp_path)
+    return nil, "Failed to write temp file: " .. (write_err or "unknown error")
+  end
+
+  return temp_path
+end
+
+-- ============================================================================
 -- Buffer Data Loading
 -- ============================================================================
 
@@ -366,48 +404,51 @@ end
 ---@return boolean success
 ---@return string? error
 function M.load_buffer_data(connection, table_name, buffer_info)
+  local temp_path, file_err
   local create_query
 
   if buffer_info.format == "csv" then
-    -- Escape single quotes in content
-    local escaped_content = buffer_info.content:gsub("'", "''")
+    -- Write CSV to temp file using proper I/O
+    temp_path, file_err = write_temp_file(buffer_info.content, ".csv")
+    if not temp_path then
+      return false, file_err
+    end
+
+    -- Track temp file for cleanup
+    table.insert(connection.temp_files, temp_path)
 
     -- Use DuckDB's read_csv_auto to auto-detect schema
-    vim.system({
-      "sh",
-      "-c",
-      string.format("echo '%s' > /tmp/%s.csv", escaped_content, table_name),
-    }, { text = true }):wait()
-
     create_query =
-      string.format("create temp table %s as select * from read_csv('/tmp/%s.csv')", table_name, table_name)
+      string.format("CREATE TEMP TABLE %s AS SELECT * FROM read_csv('%s')", table_name, temp_path)
   elseif buffer_info.format == "json" then
-    -- Write JSON to temp file (same pattern as CSV)
-    local escaped_content = buffer_info.content:gsub("'", "'\\''")
-    vim.system({
-      "sh",
-      "-c",
-      string.format("printf '%%s' '%s' > /tmp/%s.json", escaped_content, table_name),
-    }, { text = true }):wait()
+    -- Write JSON to temp file
+    temp_path, file_err = write_temp_file(buffer_info.content, ".json")
+    if not temp_path then
+      return false, file_err
+    end
+
+    -- Track temp file for cleanup
+    table.insert(connection.temp_files, temp_path)
 
     create_query = string.format(
-      "CREATE TEMP TABLE %s AS SELECT * FROM read_json('/tmp/%s.json')",
+      "CREATE TEMP TABLE %s AS SELECT * FROM read_json('%s')",
       table_name,
-      table_name
+      temp_path
     )
   elseif buffer_info.format == "jsonl" then
     -- Write JSONL to temp file
-    local escaped_content = buffer_info.content:gsub("'", "'\\''")
-    vim.system({
-      "sh",
-      "-c",
-      string.format("printf '%%s' '%s' > /tmp/%s.jsonl", escaped_content, table_name),
-    }, { text = true }):wait()
+    temp_path, file_err = write_temp_file(buffer_info.content, ".jsonl")
+    if not temp_path then
+      return false, file_err
+    end
+
+    -- Track temp file for cleanup
+    table.insert(connection.temp_files, temp_path)
 
     create_query = string.format(
-      "CREATE TEMP TABLE %s AS SELECT * FROM read_json('/tmp/%s.jsonl', format='newline_delimited')",
+      "CREATE TEMP TABLE %s AS SELECT * FROM read_json('%s', format='newline_delimited')",
       table_name,
-      table_name
+      temp_path
     )
   else
     return false, string.format("Unsupported format: %s", buffer_info.format)

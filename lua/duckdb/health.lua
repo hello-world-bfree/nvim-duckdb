@@ -170,6 +170,12 @@ end
 function M.check()
   health.start('DuckDB Plugin Health Check')
 
+  -- Show version
+  local duckdb_ok, duckdb_module = pcall(require, 'duckdb')
+  if duckdb_ok and duckdb_module.VERSION then
+    health.info(string.format('Plugin version: %s', duckdb_module.VERSION))
+  end
+
   -- Check prerequisites
   health.start('Prerequisites')
   local has_luajit = check_luajit()

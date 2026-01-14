@@ -9,7 +9,11 @@ on:
 jobs:
   test:
     name: Run Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - name: Checkout code
@@ -21,7 +25,8 @@ jobs:
           neovim: true
           version: stable
 
-      - name: Install DuckDB library
+      - name: Install DuckDB library (Linux)
+        if: runner.os == 'Linux'
         run: |
           # Download and install DuckDB C library (latest stable)
           DUCKDB_VERSION="1.4.2"
@@ -32,6 +37,12 @@ jobs:
 
           # Verify installation
           ldconfig -p | grep duckdb || echo "DuckDB library installed to /usr/local/lib"
+
+      - name: Install DuckDB library (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Install DuckDB via Homebrew
+          brew install duckdb
 
       - name: Install plenary.nvim
         run: |
@@ -77,4 +88,4 @@ jobs:
             --globals vim describe it before_each pending assert \
             --ignore 212 \
             --max-line-length 120 \
-            --no-unused-args || true
+            --no-unused-args

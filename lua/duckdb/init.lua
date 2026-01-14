@@ -2,6 +2,8 @@
 ---Main module for DuckDB Neovim integration
 local M = {}
 
+M.VERSION = "0.9.0"
+
 local query_module = require("duckdb.query")
 local ui_module = require("duckdb.ui")
 local buffer_module = require("duckdb.buffer")
@@ -26,7 +28,40 @@ M.config = {
 ---Setup plugin with user configuration
 ---@param opts DuckDBConfig?
 function M.setup(opts)
-	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+	opts = opts or {}
+
+	-- Validate max_rows
+	if opts.max_rows ~= nil then
+		if type(opts.max_rows) ~= "number" or opts.max_rows < 1 then
+			vim.notify("[DuckDB] Invalid max_rows: must be a positive number", vim.log.levels.ERROR)
+			return
+		end
+	end
+
+	-- Validate max_col_width
+	if opts.max_col_width ~= nil then
+		if type(opts.max_col_width) ~= "number" or opts.max_col_width < 1 then
+			vim.notify("[DuckDB] Invalid max_col_width: must be a positive number", vim.log.levels.ERROR)
+			return
+		end
+	end
+
+	-- Validate auto_close
+	if opts.auto_close ~= nil and type(opts.auto_close) ~= "boolean" then
+		vim.notify("[DuckDB] Invalid auto_close: must be a boolean", vim.log.levels.ERROR)
+		return
+	end
+
+	-- Validate default_format
+	if opts.default_format ~= nil then
+		local valid_formats = { csv = true, json = true, table = true }
+		if not valid_formats[opts.default_format] then
+			vim.notify("[DuckDB] Invalid default_format: must be 'csv', 'json', or 'table'", vim.log.levels.ERROR)
+			return
+		end
+	end
+
+	M.config = vim.tbl_deep_extend("force", M.config, opts)
 
 	-- Check if DuckDB is available
 	local available, err = ffi_module.is_available()

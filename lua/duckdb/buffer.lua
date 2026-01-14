@@ -89,6 +89,29 @@ function M.get_buffer_info(identifier)
 	local content = table.concat(lines, "\n")
 	local format = detect_format(filetype, name)
 
+	-- Check content size
+	local content_size = #content
+
+	-- Warn for very large buffers (>100MB)
+	if content_size > 100 * 1024 * 1024 then
+		vim.notify(
+			string.format(
+				"[DuckDB] Warning: Buffer is %dMB. Query may be slow.",
+				math.floor(content_size / 1024 / 1024)
+			),
+			vim.log.levels.WARN
+		)
+	end
+
+	-- Hard limit to prevent crashes (500MB)
+	if content_size > 500 * 1024 * 1024 then
+		return nil,
+			string.format(
+				"Buffer too large (%dMB). Maximum is 500MB.",
+				math.floor(content_size / 1024 / 1024)
+			)
+	end
+
 	return {
 		bufnr = bufnr,
 		name = name ~= "" and name or string.format("buffer_%d", bufnr),

@@ -364,23 +364,38 @@ function M.validate_buffer(identifier)
   end
 
   local result
+  local temp_file_to_cleanup = nil
 
   if buffer_info.format == "csv" then
     -- For CSV, we need an actual file path for DuckDB's reject tables
     -- If buffer has a file, use it; otherwise write to temp file
     local file_path = buffer_info.name
     if file_path == "" or not vim.fn.filereadable(file_path) then
-      -- Write buffer content to temp file
-      file_path = string.format("/tmp/duckdb_validate_%d.csv", buffer_info.bufnr)
-      local file = io.open(file_path, "w")
-      if file then
-        file:write(buffer_info.content)
-        file:close()
-      else
-        return nil, "Failed to create temporary file for validation"
+      -- Write buffer content to temp file using vim.fn.tempname()
+      file_path = vim.fn.tempname() .. ".csv"
+      local file, open_err = io.open(file_path, "w")
+      if not file then
+        return nil, "Failed to create temporary file for validation: " .. (open_err or "unknown error")
       end
+
+      local success, write_err = pcall(file.write, file, buffer_info.content)
+      file:close()
+
+      if not success then
+        pcall(os.remove, file_path)
+        return nil, "Failed to write temporary file for validation: " .. (write_err or "unknown error")
+      end
+
+      -- Track for cleanup after validation
+      temp_file_to_cleanup = file_path
     end
+
     result = validate_csv(file_path)
+
+    -- Clean up temp file if we created one
+    if temp_file_to_cleanup then
+      pcall(os.remove, temp_file_to_cleanup)
+    end
   elseif buffer_info.format == "json" then
     result = validate_json(buffer_info.content)
   elseif buffer_info.format == "jsonl" then

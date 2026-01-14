@@ -7,7 +7,7 @@ A Neovim plugin that integrates DuckDB via LuaJIT FFI to enable SQL queries on C
 - **Direct Buffer Queries**: Query CSV and JSON data directly from Neovim buffers without saving files
 - **Multiple Format Support**: CSV, JSON, and JSONL (newline-delimited JSON)
 - **Multi-Buffer Joins**: Query and join data across multiple buffers
-- **Interactive UI**: Beautiful floating window results with proper formatting
+- **Interactive UI**: Floating window results with proper formatting
 - **Export Capabilities**: Export results to CSV, JSON, or formatted tables
 - **Schema Inspection**: Inspect buffer schemas with `:DuckDBSchema`
 - **Auto-Detection**: Automatically detects file types from filetype or extension
@@ -45,7 +45,7 @@ Download from [DuckDB Downloads](https://duckdb.org/docs/installation/)
 
 ```lua
 {
-  'yourusername/duckdb.nvim',
+  'hello-world-bfree/nvim-duckdb',
   config = function()
     require('duckdb').setup({
       max_rows = 1000,        -- Maximum rows to display
@@ -61,7 +61,7 @@ Download from [DuckDB Downloads](https://duckdb.org/docs/installation/)
 
 ```lua
 use {
-  'yourusername/duckdb.nvim',
+  'hello-world-bfree/nvim-duckdb',
   config = function()
     require('duckdb').setup()
   end
@@ -71,11 +71,61 @@ use {
 ### Using [vim-plug](https://github.com/junegunn/vim-plug)
 
 ```vim
-Plug 'yourusername/duckdb.nvim'
+Plug 'hello-world-bfree/nvim-duckdb'
 
 lua << EOF
 require('duckdb').setup()
 EOF
+```
+
+## Quick Start
+
+### 1. Install DuckDB
+
+```bash
+# macOS
+brew install duckdb
+
+# Ubuntu/Debian
+sudo apt install libduckdb-dev
+
+# Arch Linux
+sudo pacman -S duckdb
+```
+
+### 2. Install the Plugin
+
+Using [lazy.nvim](https://github.com/folke/lazy.nvim):
+```lua
+{
+  'hello-world-bfree/nvim-duckdb',
+  config = function()
+    require('duckdb').setup()
+  end
+}
+```
+
+### 3. Try It Out
+
+Create a CSV file or open an existing one:
+```csv
+name,age,department
+Alice,30,Engineering
+Bob,25,Marketing
+Charlie,35,Engineering
+```
+
+Run a query:
+```vim
+:DuckDB SELECT * FROM buffer WHERE age > 28
+```
+
+Press `<leader>dq` to open the query prompt, or select SQL text and press `<leader>dq` to execute it.
+
+### 4. Verify Installation
+
+```vim
+:checkhealth duckdb
 ```
 
 ## Usage
@@ -567,25 +617,6 @@ lua/duckdb/
   validate.lua             -- Data validation with error reporting
   health.lua               -- Health checks
 ```
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## License
-
-MIT License - see LICENSE file for details
-
-## Credits
-
-- Built with [DuckDB](https://duckdb.org/) - an in-process analytical database
-- Inspired by Neovim's extensibility and LuaJIT's FFI capabilities
 
 ## See Also
 
