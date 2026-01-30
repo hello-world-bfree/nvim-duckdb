@@ -473,7 +473,7 @@ local csv = actions.format_csv(result)
 ### Requirements
 
 - Neovim 0.7+ (includes LuaJIT)
-- DuckDB shared library (`libduckdb`)
+- DuckDB 0.9.0+ shared library (`libduckdb`)
 
 ### Installing DuckDB
 

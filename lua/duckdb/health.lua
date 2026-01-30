@@ -34,6 +34,29 @@ local function check_ffi()
   end
 end
 
+---Check DuckDB version meets minimum requirement
+---@param conn any DuckDB connection
+---@param query_module any Query module
+---@return boolean meets_requirement
+---@return string? version
+local function check_duckdb_version(conn, query_module)
+  local result = query_module.execute_query(conn, "SELECT version()")
+  if result and result.rows[1] and result.rows[1][1] then
+    local version_str = result.rows[1][1]
+    local major, minor = version_str:match("v?(%d+)%.(%d+)")
+    if major and minor then
+      major, minor = tonumber(major), tonumber(minor)
+      if major > 0 or (major == 0 and minor >= 9) then
+        return true, version_str
+      else
+        return false, version_str
+      end
+    end
+    return true, version_str
+  end
+  return true, nil
+end
+
 ---Check if DuckDB library is available
 ---@return boolean
 local function check_duckdb_lib()
@@ -52,7 +75,7 @@ local function check_duckdb_lib()
   else
     health.error('DuckDB library not found', {
       err or 'Unknown error',
-      'Please install DuckDB:',
+      'Please install DuckDB 0.9.0 or later:',
       '  - Ubuntu/Debian: sudo apt install libduckdb-dev',
       '  - macOS: brew install duckdb',
       '  - Arch Linux: sudo pacman -S duckdb',
@@ -80,6 +103,21 @@ local function test_basic_query()
       err or 'Unknown error',
     })
     return false
+  end
+
+  -- Check DuckDB version
+  local meets_version, version = check_duckdb_version(conn, query_module)
+  if version then
+    if meets_version then
+      health.ok(string.format('DuckDB version: %s (meets minimum 0.9.0)', version))
+    else
+      health.error(string.format('DuckDB version %s is too old', version), {
+        'This plugin requires DuckDB 0.9.0 or later',
+        'Please upgrade DuckDB to use this plugin',
+      })
+      query_module.close_connection(conn)
+      return false
+    end
   end
 
   -- Try a simple query
