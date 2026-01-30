@@ -23,6 +23,14 @@ local T = duckdb_ffi.types
 ---@field rows_changed number Number of rows affected (for DML)
 
 -- ============================================================================
+-- SQL Identifier Helpers
+-- ============================================================================
+
+local function quote_identifier(name)
+  return '"' .. name:gsub('"', '""') .. '"'
+end
+
+-- ============================================================================
 -- Type Formatting Helpers
 -- ============================================================================
 
@@ -419,7 +427,7 @@ function M.load_buffer_data(connection, table_name, buffer_info)
 
     -- Use DuckDB's read_csv_auto to auto-detect schema
     create_query =
-      string.format("CREATE TEMP TABLE %s AS SELECT * FROM read_csv('%s')", table_name, temp_path)
+      string.format("CREATE TEMP TABLE %s AS SELECT * FROM read_csv('%s')", quote_identifier(table_name), temp_path)
   elseif buffer_info.format == "json" then
     -- Write JSON to temp file
     temp_path, file_err = write_temp_file(buffer_info.content, ".json")
@@ -432,7 +440,7 @@ function M.load_buffer_data(connection, table_name, buffer_info)
 
     create_query = string.format(
       "CREATE TEMP TABLE %s AS SELECT * FROM read_json('%s')",
-      table_name,
+      quote_identifier(table_name),
       temp_path
     )
   elseif buffer_info.format == "jsonl" then
@@ -447,7 +455,7 @@ function M.load_buffer_data(connection, table_name, buffer_info)
 
     create_query = string.format(
       "CREATE TEMP TABLE %s AS SELECT * FROM read_json('%s', format='newline_delimited')",
-      table_name,
+      quote_identifier(table_name),
       temp_path
     )
   else
@@ -523,19 +531,19 @@ function M.query_buffer(query, buffer_identifier)
     -- Replace buffer() references with actual table names in query
     local processed_query = query
     for i, id in ipairs(identifiers) do
-      local table_name = loaded_tables[i]
-      -- Replace buffer('name') or buffer(num) with table name
+      local quoted_name = quote_identifier(loaded_tables[i])
+      -- Replace buffer('name') or buffer(num) with quoted table name
       if type(id) == "string" then
         processed_query =
-          processed_query:gsub("buffer%s*%(%s*['\"]" .. id:gsub("[%-%.]", "%%%1") .. "['\"]%s*%)", table_name)
+          processed_query:gsub("buffer%s*%(%s*['\"]" .. id:gsub("[%-%.]", "%%%1") .. "['\"]%s*%)", quoted_name)
       else
-        processed_query = processed_query:gsub("buffer%s*%(%s*" .. id .. "%s*%)", table_name)
+        processed_query = processed_query:gsub("buffer%s*%(%s*" .. id .. "%s*%)", quoted_name)
       end
     end
 
     -- Replace standalone 'buffer' references if we loaded a single table
     if #loaded_tables == 1 then
-      processed_query = processed_query:gsub("%f[%w]buffer%f[%W]", loaded_tables[1])
+      processed_query = processed_query:gsub("%f[%w]buffer%f[%W]", quote_identifier(loaded_tables[1]))
     end
 
     -- Execute the query

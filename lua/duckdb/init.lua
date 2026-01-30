@@ -2,7 +2,7 @@
 ---Main module for DuckDB Neovim integration
 local M = {}
 
-M.VERSION = "0.9.0"
+M.VERSION = "0.10.0"
 
 local query_module = require("duckdb.query")
 local ui_module = require("duckdb.ui")
@@ -15,59 +15,69 @@ local validate_module = require("duckdb.validate")
 ---@field max_col_width number Maximum column width in display
 ---@field auto_close boolean Auto-close result window on selection
 ---@field default_format string Default export format (csv, json, table)
+---@field history_limit number Maximum query history entries (default: 500)
+---@field scratch_path string? Custom scratch buffer path (nil = stdpath('cache')/duckdb_scratch.sql)
+---@field inline_preview boolean Enable inline result previews
+---@field inline_preview_debounce_ms number Debounce for inline previews (default: 500)
+---@field hover_stats boolean Enable hover stats on K
 
 ---Plugin configuration
 ---@type DuckDBConfig
 M.config = {
-	max_rows = 1000,
-	max_col_width = 50,
-	auto_close = false,
-	default_format = "table",
+  max_rows = 1000,
+  max_col_width = 50,
+  auto_close = false,
+  default_format = "table",
+  history_limit = 500,
+  scratch_path = nil,
+  inline_preview = true,
+  inline_preview_debounce_ms = 500,
+  hover_stats = true,
 }
 
 ---Setup plugin with user configuration
 ---@param opts DuckDBConfig?
 function M.setup(opts)
-	opts = opts or {}
+  opts = opts or {}
 
-	-- Validate max_rows
-	if opts.max_rows ~= nil then
-		if type(opts.max_rows) ~= "number" or opts.max_rows < 1 then
-			vim.notify("[DuckDB] Invalid max_rows: must be a positive number", vim.log.levels.ERROR)
-			return
-		end
-	end
+  -- Validate max_rows
+  if opts.max_rows ~= nil then
+    if type(opts.max_rows) ~= "number" or opts.max_rows < 1 then
+      vim.notify("[DuckDB] Invalid max_rows: must be a positive number", vim.log.levels.ERROR)
+      return
+    end
+  end
 
-	-- Validate max_col_width
-	if opts.max_col_width ~= nil then
-		if type(opts.max_col_width) ~= "number" or opts.max_col_width < 1 then
-			vim.notify("[DuckDB] Invalid max_col_width: must be a positive number", vim.log.levels.ERROR)
-			return
-		end
-	end
+  -- Validate max_col_width
+  if opts.max_col_width ~= nil then
+    if type(opts.max_col_width) ~= "number" or opts.max_col_width < 1 then
+      vim.notify("[DuckDB] Invalid max_col_width: must be a positive number", vim.log.levels.ERROR)
+      return
+    end
+  end
 
-	-- Validate auto_close
-	if opts.auto_close ~= nil and type(opts.auto_close) ~= "boolean" then
-		vim.notify("[DuckDB] Invalid auto_close: must be a boolean", vim.log.levels.ERROR)
-		return
-	end
+  -- Validate auto_close
+  if opts.auto_close ~= nil and type(opts.auto_close) ~= "boolean" then
+    vim.notify("[DuckDB] Invalid auto_close: must be a boolean", vim.log.levels.ERROR)
+    return
+  end
 
-	-- Validate default_format
-	if opts.default_format ~= nil then
-		local valid_formats = { csv = true, json = true, table = true }
-		if not valid_formats[opts.default_format] then
-			vim.notify("[DuckDB] Invalid default_format: must be 'csv', 'json', or 'table'", vim.log.levels.ERROR)
-			return
-		end
-	end
+  -- Validate default_format
+  if opts.default_format ~= nil then
+    local valid_formats = { csv = true, json = true, table = true }
+    if not valid_formats[opts.default_format] then
+      vim.notify("[DuckDB] Invalid default_format: must be 'csv', 'json', or 'table'", vim.log.levels.ERROR)
+      return
+    end
+  end
 
-	M.config = vim.tbl_deep_extend("force", M.config, opts)
+  M.config = vim.tbl_deep_extend("force", M.config, opts)
 
-	-- Check if DuckDB is available
-	local available, err = ffi_module.is_available()
-	if not available then
-		vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.WARN)
-	end
+  -- Check if DuckDB is available
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.WARN)
+  end
 end
 
 ---Execute a SQL query on buffer(s)
@@ -77,55 +87,77 @@ end
 ---  - display: Display mode ("float", "split", "none") (default: "float")
 ---  - export: Export path (optional)
 ---  - format: Export format (optional, default: config.default_format)
+---  - skip_history: Don't add to history (default: false)
 ---@return QueryResult? result
 ---@return string? error
 function M.query(query, opts)
-	opts = opts or {}
+  opts = opts or {}
 
-	-- Check if DuckDB is available
-	local available, err = ffi_module.is_available()
-	if not available then
-		vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
-		return nil, err
-	end
+  -- Check if DuckDB is available
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
+    return nil, err
+  end
 
-	-- Execute query
-	local result, query_err = query_module.query_buffer(query, opts.buffer)
+  -- Track execution time
+  local start_time = vim.uv and vim.uv.hrtime() or vim.loop.hrtime()
 
-	if not result then
-		vim.notify(string.format("[DuckDB] Query failed: %s", query_err), vim.log.levels.ERROR)
-		return nil, query_err
-	end
+  -- Execute query
+  local result, query_err = query_module.query_buffer(query, opts.buffer)
 
-	-- Display results
-	local display_mode = opts.display or "float"
+  local end_time = vim.uv and vim.uv.hrtime() or vim.loop.hrtime()
+  local execution_time_ms = math.floor((end_time - start_time) / 1000000)
 
-	if display_mode == "float" then
-		ui_module.display_results(result, {
-			max_rows = M.config.max_rows,
-			max_col_width = M.config.max_col_width,
-			title = opts.title,
-		})
-	elseif display_mode == "split" then
-		ui_module.results_to_buffer(result, {
-			max_rows = M.config.max_rows,
-			max_col_width = M.config.max_col_width,
-		})
-	end
+  if not result then
+    vim.notify(string.format("[DuckDB] Query failed: %s", query_err), vim.log.levels.ERROR)
+    return nil, query_err
+  end
 
-	-- Export if requested
-	if opts.export then
-		local export_format = opts.format or M.config.default_format
-		local success, export_err = ui_module.export_results(result, opts.export, export_format)
+  -- Add to history
+  if not opts.skip_history then
+    local history = require("duckdb.history")
+    local buffer_info = buffer_module.get_buffer_info(opts.buffer)
+    history.add({
+      query = query,
+      timestamp = os.time(),
+      row_count = result.row_count,
+      execution_time_ms = execution_time_ms,
+      buffer_name = buffer_info and buffer_info.name or nil,
+    }, M.config.history_limit)
+  end
 
-		if not success then
-			vim.notify(string.format("[DuckDB] Export failed: %s", export_err), vim.log.levels.ERROR)
-		else
-			vim.notify(string.format("[DuckDB] Results exported to %s", opts.export), vim.log.levels.INFO)
-		end
-	end
+  -- Display results
+  local display_mode = opts.display or "float"
 
-	return result
+  if display_mode == "float" then
+    ui_module.display_results(result, {
+      max_rows = M.config.max_rows,
+      max_col_width = M.config.max_col_width,
+      title = opts.title,
+      query = query,
+      buffer_name = opts.buffer,
+    })
+  elseif display_mode == "split" then
+    ui_module.results_to_buffer(result, {
+      max_rows = M.config.max_rows,
+      max_col_width = M.config.max_col_width,
+    })
+  end
+
+  -- Export if requested
+  if opts.export then
+    local export_format = opts.format or M.config.default_format
+    local success, export_err = ui_module.export_results(result, opts.export, export_format)
+
+    if not success then
+      vim.notify(string.format("[DuckDB] Export failed: %s", export_err), vim.log.levels.ERROR)
+    else
+      vim.notify(string.format("[DuckDB] Results exported to %s", opts.export), vim.log.levels.INFO)
+    end
+  end
+
+  return result
 end
 
 ---Query current buffer
@@ -134,51 +166,64 @@ end
 ---@return QueryResult? result
 ---@return string? error
 function M.query_current_buffer(query, opts)
-	opts = opts or {}
-	opts.buffer = vim.api.nvim_get_current_buf()
-	return M.query(query, opts)
+  opts = opts or {}
+  opts.buffer = vim.api.nvim_get_current_buf()
+  return M.query(query, opts)
 end
 
 ---Interactive query prompt
 ---@param opts table? Options
 function M.query_prompt(opts)
-	opts = opts or {}
+  opts = opts or {}
 
-	vim.ui.input({
-		prompt = "DuckDB Query: ",
-		default = "SELECT * FROM buffer LIMIT 10",
-	}, function(input)
-		if input and input ~= "" then
-			M.query(input, opts)
-		end
-	end)
+  vim.ui.input({
+    prompt = "DuckDB Query: ",
+    default = "SELECT * FROM buffer LIMIT 10",
+  }, function(input)
+    if input and input ~= "" then
+      M.query(input, opts)
+    end
+  end)
 end
 
 ---Query from visual selection
 ---@param opts table? Options
 function M.query_visual(opts)
-	opts = opts or {}
+  opts = opts or {}
 
-	-- Get visual selection
-	local start_pos = vim.fn.getpos("'<")
-	local end_pos = vim.fn.getpos("'>")
-	local lines = vim.fn.getline(start_pos[2], end_pos[2])
+  -- Exit visual mode to set '< and '> marks
+  local esc = vim.api.nvim_replace_termcodes("<Esc>", true, false, true)
+  vim.api.nvim_feedkeys(esc, "nx", false)
 
-	if #lines == 0 then
-		vim.notify("[DuckDB] No text selected", vim.log.levels.WARN)
-		return
-	end
+  -- Get visual selection marks
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  local mode = vim.fn.visualmode()
 
-	-- Handle partial line selections
-	if #lines == 1 then
-		lines[1] = lines[1]:sub(start_pos[3], end_pos[3])
-	else
-		lines[1] = lines[1]:sub(start_pos[3])
-		lines[#lines] = lines[#lines]:sub(1, end_pos[3])
-	end
+  local lines
+  if mode == "V" then
+    -- Line-wise: get full lines
+    lines = vim.fn.getline(start_pos[2], end_pos[2])
+  else
+    -- Character-wise or block-wise: use nvim_buf_get_text for accurate extraction
+    -- nvim_buf_get_text uses 0-indexed positions
+    lines = vim.api.nvim_buf_get_text(
+      0,
+      start_pos[2] - 1,
+      start_pos[3] - 1,
+      end_pos[2] - 1,
+      end_pos[3],
+      {}
+    )
+  end
 
-	local query = table.concat(lines, "\n")
-	M.query(query, opts)
+  if #lines == 0 then
+    vim.notify("[DuckDB] No text selected", vim.log.levels.WARN)
+    return
+  end
+
+  local query = table.concat(lines, "\n")
+  M.query(query, opts)
 end
 
 ---Get buffer schema information
@@ -186,51 +231,51 @@ end
 ---@return table? schema
 ---@return string? error
 function M.get_schema(identifier)
-	local buffer_info, err = buffer_module.get_buffer_info(identifier)
-	if not buffer_info then
-		return nil, err
-	end
+  local buffer_info, err = buffer_module.get_buffer_info(identifier)
+  if not buffer_info then
+    return nil, err
+  end
 
-	-- Execute query to get schema
-	local query = "DESCRIBE buffer"
-	local result, query_err = M.query(query, {
-		buffer = identifier,
-		display = "float",
-		title = string.format(" Schema: %s ", buffer_info.name),
-	})
+  -- Execute query to get schema
+  local query = "DESCRIBE buffer"
+  local result, query_err = M.query(query, {
+    buffer = identifier,
+    display = "float",
+    title = string.format(" Schema: %s ", buffer_info.name),
+  })
 
-	return result, query_err
+  return result, query_err
 end
 
 ---List all available buffers with data
 ---@return table buffers
 function M.list_queryable_buffers()
-	local buffers = {}
+  local buffers = {}
 
-	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-		if vim.api.nvim_buf_is_loaded(bufnr) then
-			local name = vim.api.nvim_buf_get_name(bufnr)
-			local filetype = vim.api.nvim_buf_get_option(bufnr, "filetype")
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      local filetype = vim.api.nvim_buf_get_option(bufnr, "filetype")
 
-			-- Check if buffer is a queryable type
-			if
-				filetype == "csv"
-				or filetype == "json"
-				or filetype == "jsonl"
-				or name:match("%.csv$")
-				or name:match("%.json$")
-				or name:match("%.jsonl$")
-			then
-				table.insert(buffers, {
-					bufnr = bufnr,
-					name = name,
-					filetype = filetype,
-				})
-			end
-		end
-	end
+      -- Check if buffer is a queryable type
+      if
+        filetype == "csv"
+        or filetype == "json"
+        or filetype == "jsonl"
+        or name:match("%.csv$")
+        or name:match("%.json$")
+        or name:match("%.jsonl$")
+      then
+        table.insert(buffers, {
+          bufnr = bufnr,
+          name = name,
+          filetype = filetype,
+        })
+      end
+    end
+  end
 
-	return buffers
+  return buffers
 end
 
 ---Execute a query and return results as Lua table
@@ -239,100 +284,100 @@ end
 ---@return table? rows Array of row objects (tables with column name keys)
 ---@return string? error
 function M.query_as_table(query, buffer_id)
-	local result, err = query_module.query_buffer(query, buffer_id)
-	if not result then
-		return nil, err
-	end
+  local result, err = query_module.query_buffer(query, buffer_id)
+  if not result then
+    return nil, err
+  end
 
-	local rows = {}
-	for _, row in ipairs(result.rows) do
-		local obj = {}
-		for i, col in ipairs(result.columns) do
-			obj[col] = row[i]
-		end
-		table.insert(rows, obj)
-	end
+  local rows = {}
+  for _, row in ipairs(result.rows) do
+    local obj = {}
+    for i, col in ipairs(result.columns) do
+      obj[col] = row[i]
+    end
+    table.insert(rows, obj)
+  end
 
-	return rows
+  return rows
 end
 
 ---Create a command handler for :DuckDB
 ---@param args table Command arguments
 function M.command_handler(args)
-	local query = args.args
+  local query = args.args
 
-	if not query or query == "" then
-		M.query_prompt()
-		return
-	end
+  if not query or query == "" then
+    M.query_prompt()
+    return
+  end
 
-	-- Parse options from range/mods
-	local opts = {}
+  -- Parse options from range/mods
+  local opts = {}
 
-	-- Check if visual mode
-	if args.range > 0 then
-		-- Get visual selection
-		local lines = vim.fn.getline(args.line1, args.line2)
-		query = table.concat(lines, "\n")
-	end
+  -- Check if visual mode
+  if args.range > 0 then
+    -- Get visual selection
+    local lines = vim.fn.getline(args.line1, args.line2)
+    query = table.concat(lines, "\n")
+  end
 
-	M.query(query, opts)
+  M.query(query, opts)
 end
 
 ---Setup SQL completion
 ---@return table completions
 function M.get_sql_completions()
-	local keywords = {
-		"SELECT",
-		"FROM",
-		"WHERE",
-		"GROUP BY",
-		"ORDER BY",
-		"LIMIT",
-		"JOIN",
-		"LEFT JOIN",
-		"RIGHT JOIN",
-		"INNER JOIN",
-		"OUTER JOIN",
-		"ON",
-		"AS",
-		"AND",
-		"OR",
-		"NOT",
-		"IN",
-		"LIKE",
-		"BETWEEN",
-		"COUNT",
-		"SUM",
-		"AVG",
-		"MIN",
-		"MAX",
-		"DISTINCT",
-		"INSERT",
-		"UPDATE",
-		"DELETE",
-		"CREATE",
-		"DROP",
-		"ALTER",
-		"HAVING",
-		"UNION",
-		"INTERSECT",
-		"EXCEPT",
-		"CASE",
-		"WHEN",
-		"THEN",
-		"ELSE",
-		"END",
-		"NULL",
-		"IS NULL",
-		"IS NOT NULL",
-		"ASC",
-		"DESC",
-		"SHOW",
-		"buffer", -- Special function
-	}
+  local keywords = {
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "GROUP BY",
+    "ORDER BY",
+    "LIMIT",
+    "JOIN",
+    "LEFT JOIN",
+    "RIGHT JOIN",
+    "INNER JOIN",
+    "OUTER JOIN",
+    "ON",
+    "AS",
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "LIKE",
+    "BETWEEN",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "DISTINCT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "HAVING",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "NULL",
+    "IS NULL",
+    "IS NOT NULL",
+    "ASC",
+    "DESC",
+    "SHOW",
+    "buffer", -- Special function
+  }
 
-	return keywords
+  return keywords
 end
 
 ---Validate buffer content using DuckDB's parser
@@ -343,53 +388,53 @@ end
 ---@return ValidationResult? result
 ---@return string? error
 function M.validate(identifier, opts)
-	opts = opts or {}
-	local show_diagnostics = opts.show_diagnostics ~= false
-	local show_float = opts.show_float ~= false
+  opts = opts or {}
+  local show_diagnostics = opts.show_diagnostics ~= false
+  local show_float = opts.show_float ~= false
 
-	-- Check if DuckDB is available
-	local available, err = ffi_module.is_available()
-	if not available then
-		vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
-		return nil, err
-	end
+  -- Check if DuckDB is available
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
+    return nil, err
+  end
 
-	-- Validate buffer
-	local result, validate_err = validate_module.validate_buffer(identifier)
+  -- Validate buffer
+  local result, validate_err = validate_module.validate_buffer(identifier)
 
-	if not result then
-		vim.notify(string.format("[DuckDB] Validation failed: %s", validate_err), vim.log.levels.ERROR)
-		return nil, validate_err
-	end
+  if not result then
+    vim.notify(string.format("[DuckDB] Validation failed: %s", validate_err), vim.log.levels.ERROR)
+    return nil, validate_err
+  end
 
-	-- Get buffer info for display
-	local buffer_info, _ = buffer_module.get_buffer_info(identifier)
-	local bufnr = buffer_info and buffer_info.bufnr or vim.api.nvim_get_current_buf()
-	local buffer_name = buffer_info and buffer_info.name or "current buffer"
+  -- Get buffer info for display
+  local buffer_info, _ = buffer_module.get_buffer_info(identifier)
+  local bufnr = buffer_info and buffer_info.bufnr or vim.api.nvim_get_current_buf()
+  local buffer_name = buffer_info and buffer_info.name or "current buffer"
 
-	-- Set diagnostics if requested
-	if show_diagnostics then
-		validate_module.set_diagnostics(bufnr, result)
-	end
+  -- Set diagnostics if requested
+  if show_diagnostics then
+    validate_module.set_diagnostics(bufnr, result)
+  end
 
-	-- Show floating window if requested
-	if show_float then
-		validate_module.display_validation_results(result, buffer_name)
-	end
+  -- Show floating window if requested
+  if show_float then
+    validate_module.display_validation_results(result, buffer_name)
+  end
 
-	-- Notify user
-	if result.valid and #result.errors == 0 and #result.warnings == 0 then
-		vim.notify("[DuckDB] Validation passed! ✓", vim.log.levels.INFO)
-	elseif #result.errors > 0 then
-		vim.notify(string.format("[DuckDB] Validation failed with %d error(s)", #result.errors), vim.log.levels.ERROR)
-	else
-		vim.notify(
-			string.format("[DuckDB] Validation passed with %d warning(s)", #result.warnings),
-			vim.log.levels.WARN
-		)
-	end
+  -- Notify user
+  if result.valid and #result.errors == 0 and #result.warnings == 0 then
+    vim.notify("[DuckDB] Validation passed! ✓", vim.log.levels.INFO)
+  elseif #result.errors > 0 then
+    vim.notify(string.format("[DuckDB] Validation failed with %d error(s)", #result.errors), vim.log.levels.ERROR)
+  else
+    vim.notify(
+      string.format("[DuckDB] Validation passed with %d warning(s)", #result.warnings),
+      vim.log.levels.WARN
+    )
+  end
 
-	return result
+  return result
 end
 
 ---Validate current buffer
@@ -397,16 +442,196 @@ end
 ---@return ValidationResult? result
 ---@return string? error
 function M.validate_current_buffer(opts)
-	return M.validate(nil, opts)
+  return M.validate(nil, opts)
 end
 
 ---Clear validation diagnostics for a buffer
 ---@param identifier string|number|nil Buffer identifier
 function M.clear_validation(identifier)
-	local buffer_info, _ = buffer_module.get_buffer_info(identifier)
-	local bufnr = buffer_info and buffer_info.bufnr or vim.api.nvim_get_current_buf()
-	validate_module.clear_diagnostics(bufnr)
-	vim.notify("[DuckDB] Cleared validation diagnostics", vim.log.levels.INFO)
+  local buffer_info, _ = buffer_module.get_buffer_info(identifier)
+  local bufnr = buffer_info and buffer_info.bufnr or vim.api.nvim_get_current_buf()
+  validate_module.clear_diagnostics(bufnr)
+  vim.notify("[DuckDB] Cleared validation diagnostics", vim.log.levels.INFO)
+end
+
+-- ============================================================================
+-- File Format Conversion
+-- ============================================================================
+
+-- ============================================================================
+-- Query History
+-- ============================================================================
+
+---Show query history picker
+function M.history()
+  local history = require("duckdb.history")
+  history.show_picker()
+end
+
+---Clear query history
+function M.clear_history()
+  local history = require("duckdb.history")
+  history.clear()
+  vim.notify("[DuckDB] History cleared", vim.log.levels.INFO)
+end
+
+-- ============================================================================
+-- Scratch Buffer
+-- ============================================================================
+
+---Open the SQL scratch buffer
+function M.scratch()
+  local scratch = require("duckdb.scratch")
+  scratch.open(M.config)
+end
+
+-- ============================================================================
+-- Schema Statistics
+-- ============================================================================
+
+---Show SUMMARIZE statistics for buffer
+---@param identifier string|number|nil Buffer identifier
+function M.summary(identifier)
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
+    return
+  end
+
+  local buffer_info, buf_err = buffer_module.get_buffer_info(identifier)
+  if not buffer_info then
+    vim.notify(string.format("[DuckDB] %s", buf_err), vim.log.levels.ERROR)
+    return
+  end
+
+  M.query("SUMMARIZE SELECT * FROM buffer", {
+    buffer = identifier,
+    title = string.format(" Summary: %s ", vim.fn.fnamemodify(buffer_info.name, ":t")),
+  })
+end
+
+---Show column stats hover popup
+---@param identifier string|number|nil Buffer identifier
+---@param column_name string? Column name (auto-detect from cursor if nil)
+function M.hover(identifier, column_name)
+  local stats = require("duckdb.stats")
+  stats.show_hover(identifier, column_name)
+end
+
+-- ============================================================================
+-- HTTP Integration
+-- ============================================================================
+
+---POST query results to a URL
+---@param url string Target URL
+function M.post(url)
+  local http = require("duckdb.http")
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  local metadata = vim.b[bufnr].duckdb_metadata
+
+  if metadata and metadata.result then
+    http.interactive_post(url, bufnr)
+  else
+    vim.notify("[DuckDB] No query result in current buffer. Run a query first.", vim.log.levels.WARN)
+  end
+end
+
+-- ============================================================================
+-- Data Transform with Diff
+-- ============================================================================
+
+---Transform data with diff preview
+---@param query string SQL query for transformation
+---@param opts table? Options
+function M.transform(query, opts)
+  opts = opts or {}
+
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
+    return
+  end
+
+  local result, query_err = query_module.query_buffer(query, opts.buffer)
+  if not result then
+    vim.notify(string.format("[DuckDB] Query failed: %s", query_err), vim.log.levels.ERROR)
+    return
+  end
+
+  local original_buf = vim.api.nvim_get_current_buf()
+  local original_name = vim.api.nvim_buf_get_name(original_buf)
+
+  local csv_lines = ui_module.format_as_csv(result)
+  local content = table.concat(csv_lines, "\n")
+
+  local temp_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(temp_buf, 0, -1, false, csv_lines)
+  vim.api.nvim_set_option_value("filetype", "csv", { buf = temp_buf })
+  vim.api.nvim_buf_set_name(temp_buf, "DuckDB Transform Preview")
+
+  vim.cmd("vsplit")
+  vim.api.nvim_win_set_buf(0, temp_buf)
+  vim.cmd("diffthis")
+
+  vim.cmd("wincmd p")
+  vim.cmd("diffthis")
+
+  vim.ui.select({ "Apply changes", "Cancel" }, {
+    prompt = "Transform result:",
+  }, function(choice)
+    vim.cmd("diffoff!")
+
+    if choice == "Apply changes" then
+      if original_name ~= "" and original_name:match("%.csv$") then
+        vim.api.nvim_buf_set_lines(original_buf, 0, -1, false, csv_lines)
+        vim.notify("[DuckDB] Transform applied", vim.log.levels.INFO)
+      else
+        vim.ui.input({
+          prompt = "Save transformed data to: ",
+          default = vim.fn.getcwd() .. "/transformed.csv",
+          completion = "file",
+        }, function(path)
+          if path and path ~= "" then
+            local file = io.open(path, "w")
+            if file then
+              file:write(content)
+              file:close()
+              vim.cmd("edit " .. vim.fn.fnameescape(path))
+              vim.notify("[DuckDB] Saved to " .. path, vim.log.levels.INFO)
+            end
+          end
+        end)
+      end
+    end
+
+    local wins = vim.fn.win_findbuf(temp_buf)
+    for _, win in ipairs(wins) do
+      vim.api.nvim_win_close(win, true)
+    end
+  end)
+end
+
+-- ============================================================================
+-- Buffer Name Completion Helper
+-- ============================================================================
+
+---Get buffer names for completion
+---@return string[]
+function M.get_buffer_names()
+  local names = {}
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      if name ~= "" then
+        local basename = vim.fn.fnamemodify(name, ":t")
+        if basename:match("%.csv$") or basename:match("%.json$") or basename:match("%.jsonl$") then
+          table.insert(names, basename)
+        end
+      end
+    end
+  end
+  return names
 end
 
 -- ============================================================================
@@ -415,10 +640,10 @@ end
 
 ---Format options for conversion
 local format_options = {
-	csv = { ext = ".csv", opts = "FORMAT CSV, HEADER" },
-	json = { ext = ".json", opts = "FORMAT JSON, ARRAY true" },
-	jsonl = { ext = ".jsonl", opts = "FORMAT JSON, ARRAY false" },
-	parquet = { ext = ".parquet", opts = "FORMAT PARQUET" },
+  csv = { ext = ".csv", opts = "FORMAT CSV, HEADER" },
+  json = { ext = ".json", opts = "FORMAT JSON, ARRAY true" },
+  jsonl = { ext = ".jsonl", opts = "FORMAT JSON, ARRAY false" },
+  parquet = { ext = ".parquet", opts = "FORMAT PARQUET" },
 }
 
 ---Internal function to perform the actual conversion
@@ -426,82 +651,82 @@ local format_options = {
 ---@param output_path string Destination file path
 ---@param opts string DuckDB COPY options
 function M._do_convert(input_path, output_path, opts)
-	-- Detect input format from extension
-	local input_ext = vim.fn.fnamemodify(input_path, ":e"):lower()
-	local read_fn = ({
-		csv = "read_csv",
-		json = "read_json",
-		jsonl = "read_json",
-		parquet = "read_parquet",
-	})[input_ext] or "read_csv"
+  -- Detect input format from extension
+  local input_ext = vim.fn.fnamemodify(input_path, ":e"):lower()
+  local read_fn = ({
+    csv = "read_csv",
+    json = "read_json",
+    jsonl = "read_json",
+    parquet = "read_parquet",
+  })[input_ext] or "read_csv"
 
-	-- Build COPY TO query
-	local query = string.format(
-		"COPY (SELECT * FROM %s('%s')) TO '%s' (%s)",
-		read_fn,
-		input_path:gsub("'", "''"),
-		output_path:gsub("'", "''"),
-		opts
-	)
+  -- Build COPY TO query
+  local query = string.format(
+    "COPY (SELECT * FROM %s('%s')) TO '%s' (%s)",
+    read_fn,
+    input_path:gsub("'", "''"),
+    output_path:gsub("'", "''"),
+    opts
+  )
 
-	local conn, err = query_module.create_connection()
-	if not conn then
-		vim.notify("[DuckDB] " .. err, vim.log.levels.ERROR)
-		return
-	end
+  local conn, err = query_module.create_connection()
+  if not conn then
+    vim.notify("[DuckDB] " .. err, vim.log.levels.ERROR)
+    return
+  end
 
-	local _, query_err = query_module.execute_query(conn, query)
-	query_module.close_connection(conn)
+  local _, query_err = query_module.execute_query(conn, query)
+  query_module.close_connection(conn)
 
-	if query_err then
-		vim.notify("[DuckDB] Conversion failed: " .. query_err, vim.log.levels.ERROR)
-	else
-		vim.notify("[DuckDB] Converted to " .. output_path, vim.log.levels.INFO)
-		vim.cmd("edit " .. vim.fn.fnameescape(output_path))
-	end
+  if query_err then
+    vim.notify("[DuckDB] Conversion failed: " .. query_err, vim.log.levels.ERROR)
+  else
+    vim.notify("[DuckDB] Converted to " .. output_path, vim.log.levels.INFO)
+    vim.cmd("edit " .. vim.fn.fnameescape(output_path))
+  end
 end
 
 ---Convert current buffer file to another format
 ---@param format string Target format (csv, json, jsonl, parquet)
 ---@param output_path string? Optional output path (auto-generated if nil)
 function M.convert(format, output_path)
-	-- Get current buffer file path
-	local input_path = vim.api.nvim_buf_get_name(0)
-	if input_path == "" then
-		vim.notify("[DuckDB] Buffer has no file path", vim.log.levels.ERROR)
-		return
-	end
+  -- Get current buffer file path
+  local input_path = vim.api.nvim_buf_get_name(0)
+  if input_path == "" then
+    vim.notify("[DuckDB] Buffer has no file path", vim.log.levels.ERROR)
+    return
+  end
 
-	-- Validate format
-	local fmt = format_options[format]
-	if not fmt then
-		local valid = vim.tbl_keys(format_options)
-		table.sort(valid)
-		vim.notify(
-			"[DuckDB] Unsupported format: " .. format .. ". Valid: " .. table.concat(valid, ", "),
-			vim.log.levels.ERROR
-		)
-		return
-	end
+  -- Validate format
+  local fmt = format_options[format]
+  if not fmt then
+    local valid = vim.tbl_keys(format_options)
+    table.sort(valid)
+    vim.notify(
+      "[DuckDB] Unsupported format: " .. format .. ". Valid: " .. table.concat(valid, ", "),
+      vim.log.levels.ERROR
+    )
+    return
+  end
 
-	-- Determine output path (auto-name or user-specified)
-	if not output_path or output_path == "" then
-		local base = vim.fn.fnamemodify(input_path, ":r")
-		output_path = base .. fmt.ext
-	end
+  -- Determine output path (auto-name or user-specified)
+  if not output_path or output_path == "" then
+    local base = vim.fn.fnamemodify(input_path, ":r")
+    output_path = base .. fmt.ext
+  end
 
-	-- Check if output exists, prompt if so
-	if vim.fn.filereadable(output_path) == 1 then
-		vim.ui.select({ "Yes", "No" }, {
-			prompt = "Overwrite " .. output_path .. "?",
-		}, function(choice)
-			if choice == "Yes" then
-				M._do_convert(input_path, output_path, fmt.opts)
-			end
-		end)
-	else
-		M._do_convert(input_path, output_path, fmt.opts)
-	end
+  -- Check if output exists, prompt if so
+  if vim.fn.filereadable(output_path) == 1 then
+    vim.ui.select({ "Yes", "No" }, {
+      prompt = "Overwrite " .. output_path .. "?",
+    }, function(choice)
+      if choice == "Yes" then
+        M._do_convert(input_path, output_path, fmt.opts)
+      end
+    end)
+  else
+    M._do_convert(input_path, output_path, fmt.opts)
+  end
 end
 
 return M

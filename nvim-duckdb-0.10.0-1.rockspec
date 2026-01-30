@@ -1,10 +1,10 @@
 rockspec_format = "3.0"
 package = "nvim-duckdb"
-version = "0.9.0-1"
+version = "0.10.0-1"
 
 source = {
    url = "git://github.com/hello-world-bfree/nvim-duckdb",
-   tag = "v0.9.0"
+   tag = "v0.10.0"
 }
 
 description = {
@@ -20,6 +20,11 @@ description = {
       - Export capabilities (CSV, JSON, formatted tables)
       - Schema inspection with :DuckDBSchema
       - Smart validation leveraging DuckDB's parser
+      - Query history with persistent storage
+      - SQL scratch buffer for multi-line queries
+      - Result buffer actions (filter, sort, yank, export)
+      - Schema statistics and column hover
+      - HTTP POST integration for API exports
       - Full SQL support with DuckDB's analytical capabilities
    ]],
    homepage = "https://github.com/hello-world-bfree/nvim-duckdb",
@@ -43,12 +48,18 @@ build = {
    type = "builtin",
    modules = {
       ["duckdb"] = "lua/duckdb/init.lua",
+      ["duckdb.actions"] = "lua/duckdb/actions.lua",
       ["duckdb.buffer"] = "lua/duckdb/buffer.lua",
       ["duckdb.ffi"] = "lua/duckdb/ffi.lua",
       ["duckdb.health"] = "lua/duckdb/health.lua",
+      ["duckdb.history"] = "lua/duckdb/history.lua",
+      ["duckdb.http"] = "lua/duckdb/http.lua",
       ["duckdb.query"] = "lua/duckdb/query.lua",
+      ["duckdb.scratch"] = "lua/duckdb/scratch.lua",
+      ["duckdb.stats"] = "lua/duckdb/stats.lua",
       ["duckdb.ui"] = "lua/duckdb/ui.lua",
-      ["duckdb.validate"] = "lua/duckdb/validate.lua"
+      ["duckdb.validate"] = "lua/duckdb/validate.lua",
+      ["duckdb.integrations.telescope"] = "lua/duckdb/integrations/telescope.lua"
    },
    copy_directories = {
       "plugin"

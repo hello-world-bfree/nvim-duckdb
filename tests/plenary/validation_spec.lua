@@ -343,7 +343,7 @@ describe('DuckDB CSV Validation', function()
         SELECT
           'line1
 line2' as multiline,
-          'tab	here' as with_tab,
+          'tab  here' as with_tab,
           'quote''s' as with_quote
       ]])
 

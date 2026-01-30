@@ -8,31 +8,483 @@ A Neovim plugin that integrates DuckDB via LuaJIT FFI to enable SQL queries on C
 
 ## Features
 
-- **Direct Buffer Queries**: Query CSV and JSON data directly from Neovim buffers without saving files
-- **Multiple Format Support**: CSV, JSON, and JSONL (newline-delimited JSON)
+- **Direct Buffer Queries**: Query CSV, JSON, and JSONL data without saving files
 - **Multi-Buffer Joins**: Query and join data across multiple buffers
-- **Interactive UI**: Floating window results with proper formatting
-- **Export Capabilities**: Export results to CSV, JSON, or formatted tables
-- **Schema Inspection**: Inspect buffer schemas with `:DuckDBSchema`
-- **Auto-Detection**: Automatically detects file types from filetype or extension
-- **Full SQL Support**: Leverage DuckDB's complete SQL capabilities
-- **Smart Validation**: Leverage DuckDB's excellent parser to identify and pinpoint CSV/JSON errors with inline diagnostics
+- **Query History**: Persistent history with search and re-execution
+- **SQL Scratch Buffer**: Dedicated buffer for writing and executing queries
+- **Result Actions**: Filter, sort, export, and yank results in multiple formats
+- **Schema Statistics**: SUMMARIZE stats and column-level hover information
+- **Data Validation**: Inline diagnostics for CSV/JSON parsing errors
+- **Format Conversion**: Convert between CSV, JSON, JSONL, and Parquet
+- **HTTP Export**: POST query results directly to APIs
+- **Telescope Integration**: Optional pickers for history and buffers
 
-## Requirements
+---
 
-- Neovim 0.7+ (includes LuaJIT by default)
+## Tutorials
+
+Step-by-step guides to get started with nvim-duckdb.
+
+### Tutorial 1: Your First Query
+
+**Goal**: Query a CSV file and view results.
+
+1. Install DuckDB:
+   ```bash
+   # macOS
+   brew install duckdb
+
+   # Ubuntu/Debian
+   sudo apt install libduckdb-dev
+   ```
+
+2. Install the plugin with lazy.nvim:
+   ```lua
+   {
+     'hello-world-bfree/nvim-duckdb',
+     config = function()
+       require('duckdb').setup()
+     end
+   }
+   ```
+
+3. Create a test file `employees.csv`:
+   ```csv
+   name,age,department,salary
+   Alice,30,Engineering,95000
+   Bob,25,Marketing,65000
+   Charlie,35,Engineering,105000
+   ```
+
+4. Open the file and run:
+   ```vim
+   :DuckDB SELECT * FROM buffer WHERE age > 28
+   ```
+
+5. A floating window shows filtered results. Press `q` to close.
+
+### Tutorial 2: Using the Scratch Buffer
+
+**Goal**: Write multi-line queries in a dedicated SQL buffer.
+
+1. Open the scratch buffer:
+   ```vim
+   :DuckDBScratch
+   ```
+
+2. Write a query (the buffer persists across sessions):
+   ```sql
+   SELECT department,
+          COUNT(*) as headcount,
+          AVG(salary) as avg_salary
+   FROM buffer
+   GROUP BY department
+   ORDER BY avg_salary DESC;
+   ```
+
+3. Position cursor on the query and press `<CR>` to execute.
+
+4. The query executes against the last active data buffer.
+
+### Tutorial 3: Working with Results
+
+**Goal**: Filter, sort, and export query results.
+
+1. Run a query:
+   ```vim
+   :DuckDB SELECT * FROM buffer
+   ```
+
+2. In the result window, use these keys:
+   - `f` — Add a filter (prompts for WHERE clause)
+   - `s` — Sort by column under cursor
+   - `ya` — Yank as JSON array
+   - `yc` — Yank as CSV
+   - `e` — Export to file
+   - `r` — Re-run the query
+
+3. Try filtering: press `f`, enter `salary > 80000`, see filtered results.
+
+### Tutorial 4: Query History
+
+**Goal**: Browse and re-execute previous queries.
+
+1. Run several queries to build history.
+
+2. Open history picker:
+   ```vim
+   :DuckDBHistory
+   ```
+
+3. Select a query to re-execute it, or browse with arrow keys.
+
+4. History persists across Neovim sessions.
+
+---
+
+## How-To Guides
+
+Task-oriented guides for specific workflows.
+
+### Join Data from Multiple Buffers
+
+Open two files: `orders.csv` and `customers.csv`, then:
+
+```vim
+:DuckDB SELECT c.name, COUNT(o.id) as orders
+        FROM buffer('customers.csv') c
+        JOIN buffer('orders.csv') o ON c.id = o.customer_id
+        GROUP BY c.name
+```
+
+Buffer references:
+- `buffer` — current buffer
+- `buffer('filename.csv')` — buffer by name
+- `buffer(5)` — buffer by number
+
+### Validate Data Files
+
+Check CSV/JSON for parsing errors:
+
+```vim
+:DuckDBValidate
+```
+
+Errors appear as inline diagnostics. Navigate with `]d` and `[d`.
+
+Clear diagnostics:
+```vim
+:DuckDBClearValidation
+```
+
+### View Column Statistics
+
+On a CSV/JSON buffer, press `K` on any line to see column stats (count, nulls, min, max, unique values).
+
+Or run SUMMARIZE for full statistics:
+```vim
+:DuckDBSummary
+```
+
+### Convert File Formats
+
+Convert the current buffer to another format:
+
+```vim
+:DuckDBConvert json                    " Auto-names output
+:DuckDBConvert parquet output.parquet  " Specify path
+```
+
+Supported formats: `csv`, `json`, `jsonl`, `parquet`
+
+### POST Results to an API
+
+After running a query, POST results to a URL:
+
+```vim
+:DuckDBPost https://api.example.com/data
+```
+
+Select JSON format (array, object keyed by first column, or single row).
+
+### Transform Data with Diff Preview
+
+Preview changes before applying:
+
+```vim
+:DuckDBTransform SELECT name, salary * 1.1 as new_salary FROM buffer
+```
+
+A diff view shows original vs. transformed. Choose "Apply changes" or "Cancel".
+
+### Use Telescope Integration
+
+If Telescope is installed:
+
+```lua
+-- In your config
+require('duckdb.integrations.telescope').setup()
+
+-- Then use
+:Telescope duckdb history
+:Telescope duckdb buffers
+```
+
+### Query from Visual Selection
+
+Select SQL text in any buffer and press `<leader>dq` to execute it.
+
+### Export Query Results
+
+```lua
+require('duckdb').query('SELECT * FROM buffer', {
+  export = '/tmp/results.csv',
+  format = 'csv'  -- or 'json', 'table'
+})
+```
+
+### Disable Default Keymaps
+
+```lua
+vim.g.duckdb_no_default_keymaps = 1
+```
+
+---
+
+## Reference
+
+Complete reference for commands, keymaps, configuration, and API.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `:DuckDB <query>` | Execute SQL query on buffer |
+| `:DuckDBSchema [buffer]` | Show buffer schema |
+| `:DuckDBBuffers` | List queryable buffers |
+| `:DuckDBValidate [buffer]` | Validate CSV/JSON with inline diagnostics |
+| `:DuckDBScratch` | Open persistent SQL scratch buffer |
+| `:DuckDBHistory` | Browse and re-run query history |
+| `:DuckDBSummary [buffer]` | Show SUMMARIZE statistics |
+| `:DuckDBHover` | Show column stats under cursor |
+| `:DuckDBConvert <format> [path]` | Convert to csv/json/jsonl/parquet |
+| `:DuckDBPost <url>` | POST query results to URL |
+| `:DuckDBTransform [query]` | Transform with diff preview |
+
+### Default Keymaps
+
+#### Global Keymaps
+
+| Key | Mode | Description |
+|-----|------|-------------|
+| `<leader>dq` | n | Query prompt |
+| `<leader>dq` | v | Execute visual selection |
+| `<leader>ds` | n | Show schema |
+| `<leader>dv` | n | Validate buffer |
+| `<leader>db` | n | List buffers |
+| `<leader>dp` | n | Preview (LIMIT 100) |
+| `<leader>d1` | n | Preview (LIMIT 10) |
+| `<leader>d5` | n | Preview (LIMIT 50) |
+| `<leader>da` | n | Select all |
+| `<leader>dn` | n | Count rows |
+| `<leader>dh` | n | Query history |
+| `<leader>dS` | n | Open scratch buffer |
+| `<leader>du` | n | Show summary stats |
+| `<leader>dt` | n | Transform with diff |
+| `K` | n | Column stats (CSV/JSON buffers) |
+
+#### Result Buffer Keymaps
+
+| Key | Description |
+|-----|-------------|
+| `f` | Filter (add WHERE clause) |
+| `s` | Sort by column under cursor |
+| `ya` | Yank as JSON array |
+| `yo` | Yank JSON (choose format) |
+| `yc` | Yank as CSV |
+| `e` | Export to file |
+| `r` | Re-run query |
+| `q` / `<Esc>` | Close window |
+
+#### Scratch Buffer Keymaps
+
+| Key | Description |
+|-----|-------------|
+| `<CR>` | Execute statement at cursor |
+| `<C-CR>` | Execute statement at cursor |
+
+### Configuration
+
+```lua
+require('duckdb').setup({
+  -- Display
+  max_rows = 1000,           -- Maximum rows to display
+  max_col_width = 50,        -- Maximum column width
+  auto_close = false,        -- Auto-close result window
+  default_format = 'table',  -- Export format: 'csv', 'json', 'table'
+
+  -- History
+  history_limit = 500,       -- Maximum history entries
+
+  -- Scratch buffer
+  scratch_path = nil,        -- Custom path (nil = stdpath('cache')/duckdb_scratch.sql)
+
+  -- Hover/inline features
+  hover_stats = true,        -- Enable K mapping for column stats
+  inline_preview = true,     -- Enable inline result previews
+  inline_preview_debounce_ms = 500,
+})
+```
+
+### Lua API
+
+#### Core Functions
+
+```lua
+local duckdb = require('duckdb')
+
+-- Execute query with options
+duckdb.query(query, {
+  buffer = nil,        -- Buffer identifier (number, name, or nil)
+  display = 'float',   -- 'float', 'split', or 'none'
+  export = nil,        -- Export file path
+  format = nil,        -- Export format
+  title = nil,         -- Window title
+  skip_history = false -- Don't add to history
+})
+
+-- Get results as Lua table
+local rows, err = duckdb.query_as_table('SELECT * FROM buffer')
+for _, row in ipairs(rows) do
+  print(row.name, row.salary)
+end
+
+-- Interactive query prompt
+duckdb.query_prompt()
+
+-- Execute visual selection
+duckdb.query_visual()
+```
+
+#### Schema and Validation
+
+```lua
+-- Get schema
+duckdb.get_schema(buffer_id)
+
+-- List queryable buffers
+local buffers = duckdb.list_queryable_buffers()
+
+-- Validate buffer
+local result, err = duckdb.validate(buffer_id, {
+  show_diagnostics = true,
+  show_float = true
+})
+
+-- Clear validation diagnostics
+duckdb.clear_validation(buffer_id)
+```
+
+#### History and Scratch
+
+```lua
+-- Show history picker
+duckdb.history()
+
+-- Clear history
+duckdb.clear_history()
+
+-- Open scratch buffer
+duckdb.scratch()
+```
+
+#### Statistics and Hover
+
+```lua
+-- Show SUMMARIZE stats
+duckdb.summary(buffer_id)
+
+-- Show column stats popup
+duckdb.hover(buffer_id, column_name)
+```
+
+#### Export and Transform
+
+```lua
+-- Convert format
+duckdb.convert('parquet', '/tmp/output.parquet')
+
+-- POST to URL (from result buffer)
+duckdb.post('https://api.example.com/data')
+
+-- Transform with diff preview
+duckdb.transform('SELECT * FROM buffer WHERE active = true')
+```
+
+#### History Module
+
+```lua
+local history = require('duckdb.history')
+
+-- Add entry
+history.add({
+  query = 'SELECT * FROM buffer',
+  timestamp = os.time(),
+  row_count = 100,
+  execution_time_ms = 50,
+  buffer_name = 'data.csv'
+})
+
+-- Get entries
+local entries = history.get({ limit = 10, search = 'SELECT' })
+
+-- Search
+local results = history.search('users', 20)
+
+-- Recent queries
+local recent = history.recent(5)
+
+-- Clear all
+history.clear()
+```
+
+#### Actions Module
+
+```lua
+local actions = require('duckdb.actions')
+
+-- Format result as JSON
+local json_array = actions.format_json_array(result)
+local json_object = actions.format_json_object(result)
+local json_single = actions.format_json_single(result)
+local csv = actions.format_csv(result)
+```
+
+### QueryResult Object
+
+```lua
+{
+  columns = {'name', 'age'},  -- Column names
+  rows = {{'Alice', 30}},     -- Row data
+  row_count = 1,              -- Number of rows
+  column_count = 2,           -- Number of columns
+  rows_changed = 0            -- For DML statements
+}
+```
+
+### ValidationResult Object
+
+```lua
+{
+  valid = true,
+  errors = {
+    { line = 3, column = 5, message = 'Invalid value', severity = 'error' }
+  },
+  warnings = {
+    { line = 7, message = 'Inconsistent column count', severity = 'warning' }
+  }
+}
+```
+
+---
+
+## Installation
+
+### Requirements
+
+- Neovim 0.7+ (includes LuaJIT)
 - DuckDB shared library (`libduckdb`)
 
 ### Installing DuckDB
 
-**Ubuntu/Debian:**
-```bash
-sudo apt install libduckdb-dev
-```
-
 **macOS:**
 ```bash
 brew install duckdb
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt install libduckdb-dev
 ```
 
 **Arch Linux:**
@@ -43,26 +495,19 @@ sudo pacman -S duckdb
 **From Source:**
 Download from [DuckDB Downloads](https://duckdb.org/docs/installation/)
 
-## Installation
+### Plugin Installation
 
-### Using [lazy.nvim](https://github.com/folke/lazy.nvim)
-
+**lazy.nvim:**
 ```lua
 {
   'hello-world-bfree/nvim-duckdb',
   config = function()
-    require('duckdb').setup({
-      max_rows = 1000,        -- Maximum rows to display
-      max_col_width = 50,     -- Maximum column width
-      auto_close = false,     -- Auto-close result window
-      default_format = 'table' -- Default export format
-    })
+    require('duckdb').setup()
   end
 }
 ```
 
-### Using [packer.nvim](https://github.com/wbthomason/packer.nvim)
-
+**packer.nvim:**
 ```lua
 use {
   'hello-world-bfree/nvim-duckdb',
@@ -72,8 +517,7 @@ use {
 }
 ```
 
-### Using [vim-plug](https://github.com/junegunn/vim-plug)
-
+**vim-plug:**
 ```vim
 Plug 'hello-world-bfree/nvim-duckdb'
 
@@ -82,505 +526,19 @@ require('duckdb').setup()
 EOF
 ```
 
-## Quick Start
-
-### 1. Install DuckDB
-
-```bash
-# macOS
-brew install duckdb
-
-# Ubuntu/Debian
-sudo apt install libduckdb-dev
-
-# Arch Linux
-sudo pacman -S duckdb
-```
-
-### 2. Install the Plugin
-
-Using [lazy.nvim](https://github.com/folke/lazy.nvim):
-```lua
-{
-  'hello-world-bfree/nvim-duckdb',
-  config = function()
-    require('duckdb').setup()
-  end
-}
-```
-
-### 3. Try It Out
-
-Create a CSV file or open an existing one:
-```csv
-name,age,department
-Alice,30,Engineering
-Bob,25,Marketing
-Charlie,35,Engineering
-```
-
-Run a query:
-```vim
-:DuckDB SELECT * FROM buffer WHERE age > 28
-```
-
-Press `<leader>dq` to open the query prompt, or select SQL text and press `<leader>dq` to execute it.
-
-### 4. Verify Installation
+### Verify Installation
 
 ```vim
 :checkhealth duckdb
 ```
 
-## Usage
-
-### Commands
-
-#### `:DuckDB <query>`
-
-Execute a SQL query on the current buffer.
-
-```vim
-:DuckDB SELECT * FROM buffer WHERE age > 25 ORDER BY name
-
-:DuckDB SELECT COUNT(*) as total, AVG(price) as avg_price FROM buffer
-```
-
-#### Visual Selection
-
-Select multiple lines containing a SQL query and execute with `:DuckDB` or the visual mode keymap.
-
-#### `:DuckDBSchema`
-
-Show the schema of the current buffer or a specific buffer.
-
-```vim
-:DuckDBSchema
-:DuckDBSchema 5
-:DuckDBSchema data.csv
-```
-
-#### `:DuckDBBuffers`
-
-List all queryable buffers (CSV, JSON, JSONL).
-
-#### `:DuckDBValidate [buffer]`
-
-Validate CSV, JSON, or JSONL content using DuckDB's parser. This leverages DuckDB's excellent error reporting to identify issues like:
-- Inconsistent column counts in CSV files
-- Malformed JSON syntax
-- Type mismatches
-- Encoding issues
-
-The command will:
-- Display errors and warnings in a floating window
-- Show inline diagnostics with line numbers
-- Pinpoint the exact location of parsing errors
-
-```vim
-:DuckDBValidate               " Validate current buffer
-:DuckDBValidate 5            " Validate buffer 5
-:DuckDBValidate data.csv     " Validate specific buffer
-```
-
-#### `:DuckDBClearValidation [buffer]`
-
-Clear validation diagnostics from a buffer.
-
-```vim
-:DuckDBClearValidation        " Clear diagnostics from current buffer
-```
-
-### Default Keymaps
-
-- `<leader>dq` (normal mode): Open query prompt
-- `<leader>dq` (visual mode): Execute selected query
-- `<leader>ds`: Show schema of current buffer
-- `<leader>dv`: Validate current buffer
-
-Disable default keymaps in your config:
-
-```lua
-vim.g.duckdb_no_default_keymaps = 1
-```
-
-### Examples
-
-#### Querying a CSV Buffer
-
-Given a CSV file `employees.csv`:
-```csv
-name,age,department,salary
-Alice,30,Engineering,95000
-Bob,25,Marketing,65000
-Charlie,35,Engineering,105000
-Diana,28,Sales,70000
-```
-
-Open in Neovim and query:
-```vim
-:DuckDB SELECT department, COUNT(*) as count, AVG(salary) as avg_salary FROM buffer GROUP BY department
-```
-
-Result:
-```
-┌──────────────┬───────┬────────────┐
-│ department   │ count │ avg_salary │
-├──────────────┼───────┼────────────┤
-│ Engineering  │ 2     │ 100000.0   │
-│ Marketing    │ 1     │ 65000.0    │
-│ Sales        │ 1     │ 70000.0    │
-└──────────────┴───────┴────────────┘
-
-3 row(s) returned
-```
-
-#### Querying JSON Data
-
-Given a JSON file `products.json`:
-```json
-[
-  {"id": 1, "name": "Laptop", "price": 999.99, "category": "Electronics"},
-  {"id": 2, "name": "Mouse", "price": 24.99, "category": "Electronics"},
-  {"id": 3, "name": "Desk", "price": 299.99, "category": "Furniture"}
-]
-```
-
-Query:
-```vim
-:DuckDB SELECT category, COUNT(*) as items, SUM(price) as total FROM buffer GROUP BY category
-```
-
-#### Joining Multiple Buffers
-
-Open two buffers: `orders.csv` and `customers.json`
-
-```vim
-:DuckDB SELECT c.name, COUNT(o.id) as order_count FROM buffer('customers.json') c JOIN buffer('orders.csv') o ON c.id = o.customer_id GROUP BY c.name
-```
-
-#### Using Lua API
-
-```lua
-local duckdb = require('duckdb')
-
--- Execute query and get results
-local result, err = duckdb.query('SELECT * FROM buffer WHERE price > 50')
-
-if result then
-  print(string.format("Found %d rows", result.row_count))
-end
-
--- Get results as Lua table
-local rows = duckdb.query_as_table('SELECT * FROM buffer LIMIT 10')
-for _, row in ipairs(rows) do
-  print(row.name, row.age)
-end
-
--- Export results
-duckdb.query('SELECT * FROM buffer', {
-  export = '/tmp/results.csv',
-  format = 'csv'
-})
-
--- Query specific buffer
-duckdb.query('SELECT * FROM buffer', {
-  buffer = 5  -- buffer number
-})
-
--- Display in split instead of float
-duckdb.query('SELECT * FROM buffer', {
-  display = 'split'
-})
-```
-
-## Advanced Features
-
-### Complex SQL Queries
-
-DuckDB supports advanced SQL features:
-
-```sql
--- Window functions
-SELECT name, salary,
-       AVG(salary) OVER (PARTITION BY department) as dept_avg
-FROM buffer
-
--- CTEs (Common Table Expressions)
-WITH high_earners AS (
-  SELECT * FROM buffer WHERE salary > 80000
-)
-SELECT department, COUNT(*) FROM high_earners GROUP BY department
-
--- Subqueries
-SELECT * FROM buffer
-WHERE salary > (SELECT AVG(salary) FROM buffer)
-
--- JSON path extraction
-SELECT data->>'$.name' as name FROM buffer
-```
-
-### Working with JSONL
-
-For large JSON datasets, use JSONL (newline-delimited JSON):
-
-```jsonl
-{"id": 1, "name": "Alice", "score": 95}
-{"id": 2, "name": "Bob", "score": 87}
-{"id": 3, "name": "Charlie", "score": 92}
-```
-
-```vim
-:DuckDB SELECT name, score FROM buffer WHERE score > 90 ORDER BY score DESC
-```
-
-### Headerless CSV
-
-DuckDB auto-detects CSV headers. For headerless CSVs, the plugin will use generated column names.
-
-### Data Validation
-
-The plugin leverages DuckDB's excellent CSV and JSON parser to validate your data files and pinpoint errors with precision.
-
-#### Why Use DuckDB for Validation?
-
-DuckDB's parser is exceptionally good at identifying data issues:
-- **Precise Error Location**: Identifies the exact line and column of errors
-- **Detailed Error Messages**: Explains what went wrong and why
-- **Format-Specific Validation**: Understands CSV structure, JSON syntax, and type constraints
-- **Performance**: Fast validation even on large files
-
-#### Validating CSV Files
-
-Open a CSV file and run:
-
-```vim
-:DuckDBValidate
-```
-
-The plugin will detect issues like:
-- **Inconsistent column counts**: Rows with too few or too many columns
-- **Type mismatches**: Non-numeric values in numeric columns
-- **Encoding problems**: Binary or control characters in text
-- **Quote handling errors**: Unclosed quotes or improper escaping
-
-Example with `examples/invalid_csv.csv`:
-```csv
-name,age,department,salary
-Alice,30,Engineering,95000
-Bob,25,Marketing           ← Missing column
-Charlie,35,Engineering,105000,extra_field  ← Extra column
-```
-
-Running `:DuckDBValidate` will show:
-```
-Validation Results: invalid_csv.csv
-════════════════════════════════════════════════════════════
-
-✗ Errors: 0
-⚠ Warnings: 2
-
-CSV with 8 lines, 0 errors, 2 warnings
-
-Warnings:
-────────────────────────────────────────────────────────────
-1. [schema] Line 3: Inconsistent column count: expected 4 columns, found 3
-2. [schema] Line 4: Inconsistent column count: expected 4 columns, found 5
-```
-
-#### Validating JSON Files
-
-For JSON files, the validator checks:
-- **Syntax errors**: Missing commas, brackets, or quotes
-- **Structure issues**: Invalid nesting or malformed objects
-- **Schema validation**: Whether the JSON is an array (required for queries)
-
-Example with `examples/invalid_json.json`:
-```json
-[
-  {"id": 1, "name": "Alice"},
-  {"id": 2, "name": "Bob",},     ← Trailing comma
-  {
-    "id": 3                       ← Missing comma
-    "name": "Charlie"
-  }
-]
-```
-
-The validator will show the exact line number and error description.
-
-#### Validating JSONL Files
-
-For JSONL (newline-delimited JSON), each line is validated individually:
-
-```vim
-:DuckDBValidate
-```
-
-Issues detected:
-- **Invalid JSON on specific lines**: Shows which line has the error
-- **Type inconsistencies**: Mixed types across lines
-- **Malformed objects**: Missing keys or values
-
-Example with `examples/invalid_jsonl.jsonl`:
-```jsonl
-{"id": 1, "name": "Alice"}
-{"id": 2, "name": "Bob"        ← Missing closing brace
-{"id": 3 "name": "Charlie"}    ← Missing comma
-```
-
-#### Inline Diagnostics
-
-Validation errors appear as inline diagnostics in Neovim, similar to LSP errors:
-- Error messages show in the sign column
-- Hover over highlighted lines to see details
-- Navigate with `:lnext` and `:lprev` or your diagnostic navigation keys
-
-#### Using Validation in Lua
-
-```lua
-local duckdb = require('duckdb')
-
--- Validate current buffer
-local result, err = duckdb.validate()
-
-if result then
-  print(string.format("Errors: %d, Warnings: %d",
-    #result.errors, #result.warnings))
-
-  for _, error in ipairs(result.errors) do
-    print(string.format("Line %d: %s", error.line, error.message))
-  end
-end
-
--- Validate specific buffer
-duckdb.validate('data.csv')
-
--- Validate without showing UI (programmatic validation)
-duckdb.validate(nil, { show_float = false, show_diagnostics = true })
-
--- Clear diagnostics
-duckdb.clear_validation()
-```
-
-### Export Results
-
-```lua
-require('duckdb').query('SELECT * FROM buffer WHERE amount > 1000', {
-  export = '/tmp/filtered.csv',
-  format = 'csv'
-})
-
-require('duckdb').query('SELECT * FROM buffer', {
-  export = '/tmp/results.json',
-  format = 'json'
-})
-```
-
-## Health Check
-
-Run health check to verify installation:
-
-```vim
-:checkhealth duckdb
-```
-
-This will verify:
-- LuaJIT availability
-- FFI module
-- DuckDB library
-- Basic query functionality
-- CSV/JSON parsing
-
-## Configuration
-
-Full configuration options:
-
-```lua
-require('duckdb').setup({
-  -- Maximum number of rows to display in results
-  max_rows = 1000,
-
-  -- Maximum column width in display
-  max_col_width = 50,
-
-  -- Auto-close result window on selection
-  auto_close = false,
-
-  -- Default export format: 'csv', 'json', or 'table'
-  default_format = 'table',
-})
-```
-
-## API Reference
-
-### `setup(opts)`
-
-Initialize the plugin with configuration options.
-
-### `query(query, opts)`
-
-Execute a SQL query.
-
-**Parameters:**
-- `query` (string): SQL query to execute
-- `opts` (table, optional):
-  - `buffer`: Buffer identifier (number, name, or nil for current)
-  - `display`: Display mode (`"float"`, `"split"`, or `"none"`)
-  - `export`: Export file path
-  - `format`: Export format (`"csv"`, `"json"`, or `"table"`)
-  - `title`: Custom window title
-
-**Returns:**
-- `result`: QueryResult object or nil
-- `error`: Error message or nil
-
-### `query_as_table(query, buffer_id)`
-
-Execute query and return results as Lua table of objects.
-
-**Returns:**
-- `rows`: Array of row objects with column names as keys
-- `error`: Error message or nil
-
-### `get_schema(identifier)`
-
-Get schema information for a buffer.
-
-### `list_queryable_buffers()`
-
-Get list of all buffers that can be queried.
-
-### `validate(identifier, opts)`
-
-Validate buffer content using DuckDB's parser.
-
-**Parameters:**
-- `identifier` (string|number|nil): Buffer identifier (nil for current buffer)
-- `opts` (table, optional):
-  - `show_diagnostics`: Show inline diagnostics (default: true)
-  - `show_float`: Show floating window with results (default: true)
-
-**Returns:**
-- `result`: ValidationResult object with `errors`, `warnings`, and `valid` fields
-- `error`: Error message or nil
-
-### `validate_current_buffer(opts)`
-
-Validate the current buffer. Shorthand for `validate(nil, opts)`.
-
-### `clear_validation(identifier)`
-
-Clear validation diagnostics from a buffer.
-
-**Parameters:**
-- `identifier` (string|number|nil): Buffer identifier (nil for current buffer)
+---
 
 ## Troubleshooting
 
 ### "DuckDB library not found"
 
-Make sure `libduckdb` is installed and accessible. Check with:
+Ensure `libduckdb` is installed and accessible:
 ```bash
 ldconfig -p | grep duckdb  # Linux
 ls /usr/local/lib | grep duckdb  # macOS
@@ -588,42 +546,28 @@ ls /usr/local/lib | grep duckdb  # macOS
 
 ### "This plugin requires LuaJIT"
 
-You must use Neovim (not Vim), as Neovim includes LuaJIT by default.
+Use Neovim, not Vim. Neovim includes LuaJIT by default.
 
 ### "Query failed: Catalog Error"
 
-Make sure your SQL query references the correct table name:
-- Use `buffer` for the current buffer
-- Use `buffer('name')` for named buffers
-- Use `buffer(5)` for buffer number 5
+Check table references:
+- `buffer` for current buffer
+- `buffer('name')` for named buffers
+- `buffer(5)` for buffer number
 
 ### CSV not parsing correctly
 
-The plugin uses DuckDB's `read_csv_auto` which auto-detects delimiters and headers. For edge cases, you may need to save the file and use DuckDB's explicit CSV options.
+DuckDB uses `read_csv_auto` with auto-detection. For edge cases, use `:DuckDBValidate` to identify issues.
 
-## Performance
+### History not persisting
 
-- Queries are executed in-memory for maximum performance
-- Large buffers (>100MB) may take time to parse
-- Use `LIMIT` clauses for initial exploration
-- The `max_rows` config limits display but doesn't affect query execution
+History is stored in `stdpath('data')/duckdb_history.json`. Check write permissions.
 
-## Architecture
-
-```
-plugin/duckdb.lua          -- Plugin initialization, commands, keymaps
-lua/duckdb/
-  init.lua                 -- Main module, public API
-  ffi.lua                  -- DuckDB FFI bindings
-  buffer.lua               -- Buffer content extraction
-  query.lua                -- Query execution engine
-  ui.lua                   -- Result display and formatting
-  validate.lua             -- Data validation with error reporting
-  health.lua               -- Health checks
-```
+---
 
 ## See Also
 
 - [DuckDB Documentation](https://duckdb.org/docs/)
+- [DuckDB SQL Reference](https://duckdb.org/docs/sql/introduction)
 - [LuaJIT FFI Tutorial](http://luajit.org/ext_ffi_tutorial.html)
 - [Neovim Lua Guide](https://neovim.io/doc/user/lua-guide.html)
