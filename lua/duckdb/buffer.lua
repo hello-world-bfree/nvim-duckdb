@@ -42,8 +42,9 @@ end
 ---Detect file format from filetype or filename
 ---@param filetype string
 ---@param filename string
+---@param content string?
 ---@return string format
-local function detect_format(filetype, filename)
+local function detect_format(filetype, filename, content)
   -- Check filetype first
   if filetype == "csv" then
     return "csv"
@@ -60,6 +61,31 @@ local function detect_format(filetype, filename)
     return "jsonl"
   elseif filename:match("%.json$") then
     return "json"
+  elseif filename:match("%.txt$") then
+    -- For txt files, try to detect content type
+    if content then
+      local trimmed = content:match("^%s*(.)")
+      if trimmed == "[" or trimmed == "{" then
+        -- Check if it's valid JSON
+        local ok, decoded = pcall(vim.json.decode, content)
+        if ok then
+          if type(decoded) == "table" and decoded[1] ~= nil then
+            return "json" -- JSON array
+          else
+            return "json" -- JSON object
+          end
+        end
+        -- Check if first non-empty line is valid JSON (JSONL)
+        local first_line = content:match("^%s*([^\n]+)")
+        if first_line then
+          local line_ok = pcall(vim.json.decode, first_line)
+          if line_ok then
+            return "jsonl"
+          end
+        end
+      end
+    end
+    return "csv" -- Default txt to csv
   end
 
   -- Default to csv if uncertain
@@ -87,7 +113,7 @@ function M.get_buffer_info(identifier)
   end
 
   local content = table.concat(lines, "\n")
-  local format = detect_format(filetype, name)
+  local format = detect_format(filetype, name, content)
 
   -- Check content size
   local content_size = #content

@@ -262,9 +262,11 @@ function M.list_queryable_buffers()
         filetype == "csv"
         or filetype == "json"
         or filetype == "jsonl"
+        or filetype == "text"
         or name:match("%.csv$")
         or name:match("%.json$")
         or name:match("%.jsonl$")
+        or name:match("%.txt$")
       then
         table.insert(buffers, {
           bufnr = bufnr,

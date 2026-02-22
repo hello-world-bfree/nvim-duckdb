@@ -438,8 +438,9 @@ function M.load_buffer_data(connection, table_name, buffer_info)
     -- Track temp file for cleanup
     table.insert(connection.temp_files, temp_path)
 
+    -- Use read_json_auto which handles both arrays and objects
     create_query = string.format(
-      "CREATE TEMP TABLE %s AS SELECT * FROM read_json('%s')",
+      "CREATE TEMP TABLE %s AS SELECT * FROM read_json_auto('%s')",
       quote_identifier(table_name),
       temp_path
     )

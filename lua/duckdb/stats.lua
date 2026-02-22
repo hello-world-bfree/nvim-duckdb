@@ -150,16 +150,33 @@ function M.format_column_stats(stats)
   return lines
 end
 
+---Get column name at cursor position in CSV header
+---@return string?
+local function get_column_at_cursor()
+  local cursor_col = vim.api.nvim_win_get_cursor(0)[2] + 1
+  local line = vim.api.nvim_get_current_line()
+
+  local pos = 1
+  for field in (line .. ","):gmatch("([^,]*),") do
+    local field_start = pos
+    local field_end = pos + #field - 1
+
+    if cursor_col >= field_start and cursor_col <= field_end then
+      return field:gsub("^%s*", ""):gsub("%s*$", "")
+    end
+
+    pos = field_end + 2
+  end
+
+  return nil
+end
+
 ---Show hover popup with column stats
 ---@param buffer_id string|number|nil
 ---@param column_name string?
 function M.show_hover(buffer_id, column_name)
   if not column_name then
-    local cursor_line = vim.api.nvim_get_current_line()
-    column_name = cursor_line:match("^([^,]+)") or cursor_line:match("^%s*(.-)%s*$")
-    if column_name then
-      column_name = column_name:gsub("^%s*", ""):gsub("%s*$", "")
-    end
+    column_name = get_column_at_cursor()
   end
 
   if not column_name or column_name == "" then
