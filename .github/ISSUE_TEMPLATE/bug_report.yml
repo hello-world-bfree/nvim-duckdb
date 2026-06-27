@@ -60,7 +60,7 @@ body:
     attributes:
       label: DuckDB Version
       description: Version of libduckdb installed (e.g., from `brew info duckdb`)
-      placeholder: "v1.4.2"
+      placeholder: "v1.5.4"
 
   - type: input
     id: os

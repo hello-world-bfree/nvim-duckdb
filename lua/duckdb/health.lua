@@ -46,7 +46,7 @@ local function check_duckdb_lib()
   else
     health.error('DuckDB library not found', {
       err or 'Unknown error',
-      'Please install DuckDB 0.9.0 or later:',
+      'Please install DuckDB 0.10.0 or later:',
       '  - Ubuntu/Debian: sudo apt install libduckdb-dev',
       '  - macOS: brew install duckdb',
       '  - Arch Linux: sudo pacman -S duckdb',
@@ -81,12 +81,12 @@ local function check_duckdb_connection()
     local major, minor = version_str:match("v?(%d+)%.(%d+)")
     if major and minor then
       major, minor = tonumber(major), tonumber(minor)
-      if major > 0 or (major == 0 and minor >= 9) then
-        health.ok(string.format('DuckDB version: %s (meets minimum 0.9.0)', version_str))
+      if major > 0 or (major == 0 and minor >= 10) then
+        health.ok(string.format('DuckDB version: %s (meets minimum 0.10.0)', version_str))
         return true
       else
         health.error(string.format('DuckDB version %s is too old', version_str), {
-          'This plugin requires DuckDB 0.9.0 or later',
+          'This plugin requires DuckDB 0.10.0 or later',
           'Please upgrade DuckDB to use this plugin',
         })
         return false

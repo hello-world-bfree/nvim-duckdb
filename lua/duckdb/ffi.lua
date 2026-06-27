@@ -7,13 +7,13 @@ local ffi = require('ffi')
 -- Guard against multiple ffi.cdef calls (LuaJIT doesn't allow redefining types)
 -- This is necessary for test environments that reload modules
 if not pcall(ffi.typeof, 'duckdb_database') then
-  -- DuckDB C API declarations (Modern API - Nov 2025)
+  -- DuckDB C API declarations (Modern API - v1.5.4)
   -- Source: https://github.com/duckdb/duckdb/blob/main/src/include/duckdb.h
   ffi.cdef[[
     // Basic type definitions
     typedef uint64_t idx_t;
 
-    // Type enumeration (complete as of Nov 2025)
+    // Type enumeration (complete as of v1.5.4)
     typedef enum {
       DUCKDB_TYPE_INVALID = 0,
       DUCKDB_TYPE_BOOLEAN = 1,
@@ -50,8 +50,13 @@ if not pcall(ffi.typeof, 'duckdb_database') then
       DUCKDB_TYPE_UHUGEINT = 32,
       DUCKDB_TYPE_ARRAY = 33,
       DUCKDB_TYPE_ANY = 34,
-      DUCKDB_TYPE_VARINT = 35,
+      DUCKDB_TYPE_BIGNUM = 35,
       DUCKDB_TYPE_SQLNULL = 36,
+      DUCKDB_TYPE_STRING_LITERAL = 37,
+      DUCKDB_TYPE_INTEGER_LITERAL = 38,
+      DUCKDB_TYPE_TIME_NS = 39,
+      DUCKDB_TYPE_GEOMETRY = 40,
+      DUCKDB_TYPE_VARIANT = 41,
     } duckdb_type;
 
     typedef enum {
@@ -200,7 +205,7 @@ function M.is_available()
   return false, "DuckDB library not found. Please install libduckdb."
 end
 
----Type name mapping (complete as of Nov 2025)
+---Type name mapping (complete as of v1.5.4)
 M.type_names = {
   [0] = "INVALID",
   [1] = "BOOLEAN",
@@ -237,8 +242,13 @@ M.type_names = {
   [32] = "UHUGEINT",
   [33] = "ARRAY",
   [34] = "ANY",
-  [35] = "VARINT",
+  [35] = "BIGNUM",
   [36] = "SQLNULL",
+  [37] = "STRING_LITERAL",
+  [38] = "INTEGER_LITERAL",
+  [39] = "TIME_NS",
+  [40] = "GEOMETRY",
+  [41] = "VARIANT",
 }
 
 ---Type constants for cleaner code
@@ -278,8 +288,13 @@ M.types = {
   UHUGEINT = 32,
   ARRAY = 33,
   ANY = 34,
-  VARINT = 35,
+  BIGNUM = 35,
   SQLNULL = 36,
+  STRING_LITERAL = 37,
+  INTEGER_LITERAL = 38,
+  TIME_NS = 39,
+  GEOMETRY = 40,
+  VARIANT = 41,
 }
 
 ---Extract string from duckdb_string_t structure
