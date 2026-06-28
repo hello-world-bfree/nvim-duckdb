@@ -215,7 +215,7 @@ describe('DuckDB FFI Cleanup', function()
       assert.is_number(row[3])     -- double
       assert.is_true(math.abs(row[3] - 3.14) < 0.001)  -- float
       assert.equals('hello world', row[4])  -- string
-      assert.is_nil(row[5])  -- null
+      assert.is_true(query_module.is_null(row[5]))  -- null
 
       query_module.close_connection(conn)
     end)

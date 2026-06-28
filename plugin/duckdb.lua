@@ -54,6 +54,80 @@ end, {
   desc = "Execute DuckDB SQL query on buffer (alias)",
 })
 
+-- Create :DuckDBCancel command (interrupt a running async query)
+vim.api.nvim_create_user_command("DuckDBCancel", function()
+  if not duckdb.cancel() then
+    vim.notify("[DuckDB] No query is currently running", vim.log.levels.INFO)
+  end
+end, {
+  desc = "Cancel the currently running DuckDB query",
+})
+
+-- Create :DuckDBParam command (parameterized query with inline values)
+-- Usage: :DuckDBParam SELECT * FROM buffer WHERE id > $1 -- 42
+-- Everything before " -- " is the SQL; whitespace-separated tokens after are
+-- bound positionally to $1..$N (use 'NULL' for a SQL NULL).
+vim.api.nvim_create_user_command("DuckDBParam", function(args)
+  local sql, rest = args.args:match("^(.-)%s+%-%-%s+(.*)$")
+  if not sql then
+    vim.notify('[DuckDB] Usage: :DuckDBParam <sql> -- <val1> <val2> ...', vim.log.levels.ERROR)
+    return
+  end
+
+  -- Split the value list on whitespace. 'NULL' (uppercase) binds SQL NULL via
+  -- the NULL sentinel, which keeps its array position (a Lua nil would shift it).
+  local NULL = require("duckdb.query").NULL
+  local values = {}
+  for i, token in ipairs(vim.split(rest, "%s+", { trimempty = true })) do
+    values[i] = (token == "NULL") and NULL or token
+  end
+
+  duckdb.query_params_async(sql, values)
+end, {
+  nargs = "+",
+  desc = "Run a parameterized query: <sql> -- <values...>",
+})
+
+-- Create :DuckDBImport command (bulk-load delimited lines via the appender)
+-- Usage: :DuckDBImport [table_name]   (uses visual range if given, else buffer)
+-- First line is the header; remaining lines are data rows (comma-delimited).
+vim.api.nvim_create_user_command("DuckDBImport", function(args)
+  local lines
+  if args.range > 0 then
+    lines = vim.fn.getline(args.line1, args.line2)
+  else
+    lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  end
+  local opts = {}
+  if args.args ~= "" then
+    opts.table_name = args.args
+  end
+  duckdb.import_lines_async(lines, opts)
+end, {
+  nargs = "?",
+  range = true,
+  desc = "Bulk-import delimited lines (header + rows) into a DuckDB table",
+})
+
+-- Create :DuckDBScript command (run the current buffer as a multi-statement script)
+vim.api.nvim_create_user_command("DuckDBScript", function(args)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local script
+  if args.range > 0 then
+    script = table.concat(vim.fn.getline(args.line1, args.line2), "\n")
+  else
+    script = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  end
+  if script:match("^%s*$") then
+    vim.notify("[DuckDB] Nothing to run", vim.log.levels.WARN)
+    return
+  end
+  duckdb.query_script_async(script)
+end, {
+  range = true,
+  desc = "Run the current buffer (or range) as a multi-statement SQL script",
+})
+
 -- Create :DuckDBSchema command
 vim.api.nvim_create_user_command("DuckDBSchema", function(args)
   local buffer_id = args.args ~= "" and args.args or nil
@@ -210,25 +284,29 @@ local function setup_default_keymaps()
     vim.cmd("DuckDBBuffers")
   end, "DuckDB: List buffers")
 
-  -- Quick preview keymaps
+  set_keymap("n", "<leader>dc", function()
+    vim.cmd("DuckDBCancel")
+  end, "DuckDB: Cancel running query")
+
+  -- Quick preview keymaps (async: non-blocking, cancellable via <leader>dc)
   set_keymap("n", "<leader>dp", function()
-    require("duckdb").query("SELECT * FROM buffer LIMIT 100")
+    require("duckdb").query_async("SELECT * FROM buffer LIMIT 100")
   end, "DuckDB: Preview (LIMIT 100)")
 
   set_keymap("n", "<leader>d1", function()
-    require("duckdb").query("SELECT * FROM buffer LIMIT 10")
+    require("duckdb").query_async("SELECT * FROM buffer LIMIT 10")
   end, "DuckDB: Preview (LIMIT 10)")
 
   set_keymap("n", "<leader>d5", function()
-    require("duckdb").query("SELECT * FROM buffer LIMIT 50")
+    require("duckdb").query_async("SELECT * FROM buffer LIMIT 50")
   end, "DuckDB: Preview (LIMIT 50)")
 
   set_keymap("n", "<leader>da", function()
-    require("duckdb").query("SELECT * FROM buffer")
+    require("duckdb").query_async("SELECT * FROM buffer")
   end, "DuckDB: Select all")
 
   set_keymap("n", "<leader>dn", function()
-    require("duckdb").query("SELECT COUNT(*) as row_count FROM buffer")
+    require("duckdb").query_async("SELECT COUNT(*) as row_count FROM buffer")
   end, "DuckDB: Count rows")
 
   -- New keymaps for Phase 1-3 features

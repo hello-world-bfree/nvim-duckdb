@@ -2,7 +2,7 @@
 ---Main module for DuckDB Neovim integration
 local M = {}
 
-M.VERSION = "0.10.0"
+M.VERSION = "0.11.0"
 
 local query_module = require("duckdb.query")
 local ui_module = require("duckdb.ui")
@@ -160,6 +160,346 @@ function M.query(query, opts)
   return result
 end
 
+-- Handle to the currently running async query, so it can be cancelled.
+-- nil when no async query is in flight.
+---@type { cancel: fun(), conn: DuckDBConnection, timer: any }?
+M._inflight = nil
+
+-- Spinner frames for the in-flight progress notification.
+local SPINNER_FRAMES = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+
+---Cancel the currently running async query, if any.
+---@return boolean cancelled True if a query was in flight and was interrupted
+function M.cancel()
+  if M._inflight then
+    M._inflight.cancel()
+    return true
+  end
+  return false
+end
+
+---Execute a query asynchronously without blocking the Neovim event loop.
+---
+---Shows a spinner with live progress while the query runs, and can be cancelled
+---via M.cancel() (see :DuckDBCancel / <leader>dc). Only one async query runs at
+---a time; starting a new one is rejected while another is in flight.
+---
+---Render a successful result: add to history and display per opts.
+---@param result QueryResult
+---@param query string The query/script text (for history + result title)
+---@param execution_time_ms number
+---@param opts table Options (display, export, format, title, buffer, skip_history)
+local function display_result(result, query, execution_time_ms, opts)
+  if not opts.skip_history then
+    local history = require("duckdb.history")
+    local buffer_info = buffer_module.get_buffer_info(opts.buffer)
+    history.add({
+      query = query,
+      timestamp = os.time(),
+      row_count = result.row_count,
+      execution_time_ms = execution_time_ms,
+      buffer_name = buffer_info and buffer_info.name or nil,
+    }, M.config.history_limit)
+  end
+
+  local display_mode = opts.display or "float"
+  if display_mode == "float" then
+    ui_module.display_results(result, {
+      max_rows = M.config.max_rows,
+      max_col_width = M.config.max_col_width,
+      title = opts.title,
+      query = query,
+      buffer_name = opts.buffer,
+    })
+  elseif display_mode == "split" then
+    ui_module.results_to_buffer(result, {
+      max_rows = M.config.max_rows,
+      max_col_width = M.config.max_col_width,
+    })
+  end
+
+  if opts.export then
+    local export_format = opts.format or M.config.default_format
+    local success, export_err = ui_module.export_results(result, opts.export, export_format)
+    if not success then
+      vim.notify(string.format("[DuckDB] Export failed: %s", export_err), vim.log.levels.ERROR)
+    else
+      vim.notify(string.format("[DuckDB] Results exported to %s", opts.export), vim.log.levels.INFO)
+    end
+  end
+end
+
+---Run an async operation behind the progress spinner and single-flight guard.
+---
+---`start_fn(on_complete)` kicks off the work and must return the live
+---DuckDBConnection (or nil on synchronous setup failure). It calls `on_complete`
+---exactly once with (result, err) when done; the connection is expected to be
+---closed by `start_fn`'s own machinery right after `on_complete` runs.
+---
+---`on_result(result, err, execution_time_ms)` handles the resolved outcome.
+---
+---@param start_fn fun(on_complete: fun(result: QueryResult?, err: string?)): DuckDBConnection?
+---@param on_result fun(result: QueryResult?, err: string?, execution_time_ms: number)
+local function run_async(start_fn, on_result)
+  local start_time = vim.uv and vim.uv.hrtime() or vim.loop.hrtime()
+
+  -- Liveness flag for the spinner. Flipped synchronously the instant the work
+  -- resolves, BEFORE the connection is closed, so no scheduled spinner tick can
+  -- run against a torn-down query.
+  --
+  -- NOTE: we deliberately do NOT call duckdb_query_progress here. That entry
+  -- point is unsafe to poll while we drive execution through the pending-result
+  -- interface (it reads executor state that the task loop is mutating) and
+  -- segfaults. The spinner animates without a percentage instead.
+  local completed = false
+
+  local frame = 1
+  local spinner = vim.loop.new_timer()
+  spinner:start(
+    0,
+    100,
+    vim.schedule_wrap(function()
+      if completed then
+        return
+      end
+      vim.notify(
+        string.format("[DuckDB] %s Running query…", SPINNER_FRAMES[frame]),
+        vim.log.levels.INFO
+      )
+      frame = (frame % #SPINNER_FRAMES) + 1
+    end)
+  )
+
+  local function stop_spinner()
+    if not spinner:is_closing() then
+      spinner:stop()
+      spinner:close()
+    end
+  end
+
+  local conn = start_fn(function(result, err)
+    completed = true
+    stop_spinner()
+    M._inflight = nil
+
+    local end_time = vim.uv and vim.uv.hrtime() or vim.loop.hrtime()
+    on_result(result, err, math.floor((end_time - start_time) / 1000000))
+  end)
+
+  -- Setup failed synchronously: on_complete already fired, so just stop spinner.
+  if not conn then
+    stop_spinner()
+    return
+  end
+
+  M._inflight = {
+    cancel = function()
+      query_module.interrupt(conn)
+    end,
+    conn = conn,
+    timer = spinner,
+  }
+end
+
+---Guard shared by all async entry points: library available + nothing running.
+---@return boolean ok
+local function async_preflight()
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
+    return false
+  end
+  if M._inflight then
+    vim.notify("[DuckDB] A query is already running (use :DuckDBCancel)", vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
+---Execute a query asynchronously without blocking the Neovim event loop.
+---Mirrors M.query for history + display, but returns nothing — results are
+---delivered through the spinner-driven completion path.
+---@param query string SQL query
+---@param opts table? Options (same as M.query)
+function M.query_async(query, opts)
+  opts = opts or {}
+  if not async_preflight() then
+    return
+  end
+
+  run_async(function(on_complete)
+    return query_module.query_buffer_async(query, opts.buffer, on_complete, { interval_ms = opts.interval_ms })
+  end, function(result, query_err, execution_time_ms)
+    if not result then
+      vim.notify(string.format("[DuckDB] Query failed: %s", query_err), vim.log.levels.ERROR)
+      return
+    end
+    display_result(result, query, execution_time_ms, opts)
+  end)
+end
+
+---Execute a multi-statement SQL script asynchronously. Each `;`-separated
+---statement runs in order on a shared connection; the LAST statement's result
+---is displayed. Intended for the scratch buffer / running a whole SQL file.
+---@param script string One or more SQL statements
+---@param opts table? Options (same as M.query)
+function M.query_script_async(script, opts)
+  opts = opts or {}
+  if not async_preflight() then
+    return
+  end
+
+  -- Open a dedicated connection for the whole script and close it on completion.
+  local conn = query_module.create_connection()
+  if not conn then
+    vim.notify("[DuckDB] Failed to open connection", vim.log.levels.ERROR)
+    return
+  end
+
+  run_async(function(on_complete)
+    query_module.execute_script_async(conn, script, function(result, err, info)
+      query_module.close_connection(conn)
+      -- Stash statement info on opts so on_result can surface it.
+      opts._script_info = info
+      on_complete(result, err)
+    end, { interval_ms = opts.interval_ms })
+    return conn
+  end, function(result, query_err, execution_time_ms)
+    local info = opts._script_info
+    if not result then
+      local where = info and string.format(" (statement %d)", info.executed + 1) or ""
+      vim.notify(string.format("[DuckDB] Script failed%s: %s", where, query_err), vim.log.levels.ERROR)
+      return
+    end
+    if info and info.statement_count > 1 then
+      vim.notify(
+        string.format("[DuckDB] Ran %d statements", info.statement_count),
+        vim.log.levels.INFO
+      )
+    end
+    display_result(result, script, execution_time_ms, opts)
+  end)
+end
+
+---Execute a parameterized query asynchronously. `values` are bound positionally
+---to the query's $1..$N / ? parameters (as VARCHAR; DuckDB casts to the target
+---type). Buffer references in the query are loaded as usual.
+---@param query string SQL query with parameters
+---@param values table<any> Positional parameter values
+---@param opts table? Options (same as M.query)
+function M.query_params_async(query, values, opts)
+  opts = opts or {}
+  if not async_preflight() then
+    return
+  end
+
+  run_async(function(on_complete)
+    return query_module.query_buffer_with_params_async(
+      query,
+      values,
+      opts.buffer,
+      on_complete,
+      { interval_ms = opts.interval_ms }
+    )
+  end, function(result, query_err, execution_time_ms)
+    if not result then
+      vim.notify(string.format("[DuckDB] Query failed: %s", query_err), vim.log.levels.ERROR)
+      return
+    end
+    display_result(result, query, execution_time_ms, opts)
+  end)
+end
+
+---Bulk-insert rows into an existing table via the appender (fast path).
+---Thin wrapper over query.append_rows for programmatic use; the caller owns the
+---connection (so the target table persists for the append).
+---@param connection DuckDBConnection
+---@param table_name string
+---@param rows table<table>
+---@return integer? appended
+---@return string? error
+function M.append_rows(connection, table_name, rows)
+  return query_module.append_rows(connection, table_name, rows)
+end
+
+---Import delimited lines into a fresh in-memory table and display it.
+---
+---The first line is treated as a header (column names); the remaining lines are
+---data rows. All columns are created as VARCHAR and bulk-loaded via the appender
+---— much faster than per-row INSERTs. Use this to pull a visual selection or a
+---raw delimited buffer into DuckDB for ad-hoc querying.
+---
+---@param lines table<string> Delimited text lines (first = header)
+---@param opts table? { delimiter?: string, table_name?: string } + display options
+function M.import_lines_async(lines, opts)
+  opts = opts or {}
+  local delimiter = opts.delimiter or ","
+  local table_name = opts.table_name or "imported"
+
+  local available, err = ffi_module.is_available()
+  if not available then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
+    return
+  end
+
+  -- Drop blank trailing lines; need at least a header + one data row.
+  local rows = {}
+  for _, line in ipairs(lines) do
+    if not line:match("^%s*$") then
+      table.insert(rows, vim.split(line, delimiter, { plain = true }))
+    end
+  end
+  if #rows < 2 then
+    vim.notify("[DuckDB] Need a header line plus at least one data row", vim.log.levels.WARN)
+    return
+  end
+
+  local header = table.remove(rows, 1)
+
+  local conn, conn_err = query_module.create_connection()
+  if not conn then
+    vim.notify(string.format("[DuckDB] %s", conn_err), vim.log.levels.ERROR)
+    return
+  end
+
+  -- Build CREATE TABLE with one VARCHAR column per header field.
+  local quoted_table = '"' .. table_name:gsub('"', '""') .. '"'
+  local cols = {}
+  for _, name in ipairs(header) do
+    cols[#cols + 1] = '"' .. name:gsub('"', '""') .. '" VARCHAR'
+  end
+  local create_sql = string.format("CREATE TABLE %s (%s)", quoted_table, table.concat(cols, ", "))
+
+  local _, create_err = query_module.execute_query(conn, create_sql)
+  if create_err then
+    query_module.close_connection(conn)
+    vim.notify(string.format("[DuckDB] Failed to create table: %s", create_err), vim.log.levels.ERROR)
+    return
+  end
+
+  local appended, append_err = query_module.append_rows(conn, table_name, rows)
+  if not appended then
+    query_module.close_connection(conn)
+    vim.notify(string.format("[DuckDB] Import failed: %s", append_err), vim.log.levels.ERROR)
+    return
+  end
+
+  -- Display the imported table.
+  local result, query_err = query_module.execute_query(conn, "SELECT * FROM " .. quoted_table)
+  query_module.close_connection(conn)
+  if not result then
+    vim.notify(string.format("[DuckDB] %s", query_err), vim.log.levels.ERROR)
+    return
+  end
+
+  vim.notify(string.format("[DuckDB] Imported %d rows into %s", appended, table_name), vim.log.levels.INFO)
+  ui_module.display_results(result, {
+    max_rows = M.config.max_rows,
+    max_col_width = M.config.max_col_width,
+    title = string.format(" Imported: %s ", table_name),
+  })
+end
+
 ---Query current buffer
 ---@param query string SQL query
 ---@param opts table? Options
@@ -181,7 +521,7 @@ function M.query_prompt(opts)
     default = "SELECT * FROM buffer LIMIT 10",
   }, function(input)
     if input and input ~= "" then
-      M.query(input, opts)
+      M.query_async(input, opts)
     end
   end)
 end
@@ -223,7 +563,7 @@ function M.query_visual(opts)
   end
 
   local query = table.concat(lines, "\n")
-  M.query(query, opts)
+  M.query_async(query, opts)
 end
 
 ---Get buffer schema information
@@ -327,7 +667,7 @@ function M.command_handler(args)
     query = table.concat(lines, "\n")
   end
 
-  M.query(query, opts)
+  M.query_async(query, opts)
 end
 
 ---Setup SQL completion

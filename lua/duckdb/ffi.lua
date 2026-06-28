@@ -64,6 +64,38 @@ if not pcall(ffi.typeof, 'duckdb_database') then
       DuckDBError = 1
     } duckdb_state;
 
+    // Statement type (kind of SQL statement that produced a result)
+    typedef enum {
+      DUCKDB_STATEMENT_TYPE_INVALID = 0,
+      DUCKDB_STATEMENT_TYPE_SELECT = 1,
+      DUCKDB_STATEMENT_TYPE_INSERT = 2,
+      DUCKDB_STATEMENT_TYPE_UPDATE = 3,
+      DUCKDB_STATEMENT_TYPE_EXPLAIN = 4,
+      DUCKDB_STATEMENT_TYPE_DELETE = 5,
+      DUCKDB_STATEMENT_TYPE_PREPARE = 6,
+      DUCKDB_STATEMENT_TYPE_CREATE = 7,
+      DUCKDB_STATEMENT_TYPE_EXECUTE = 8,
+      DUCKDB_STATEMENT_TYPE_ALTER = 9,
+      DUCKDB_STATEMENT_TYPE_TRANSACTION = 10,
+      DUCKDB_STATEMENT_TYPE_COPY = 11,
+      DUCKDB_STATEMENT_TYPE_ANALYZE = 12,
+      DUCKDB_STATEMENT_TYPE_VARIABLE_SET = 13,
+      DUCKDB_STATEMENT_TYPE_CREATE_FUNC = 14,
+      DUCKDB_STATEMENT_TYPE_DROP = 15,
+      DUCKDB_STATEMENT_TYPE_EXPORT = 16,
+      DUCKDB_STATEMENT_TYPE_PRAGMA = 17,
+      DUCKDB_STATEMENT_TYPE_VACUUM = 18,
+      DUCKDB_STATEMENT_TYPE_CALL = 19,
+      DUCKDB_STATEMENT_TYPE_SET = 20,
+      DUCKDB_STATEMENT_TYPE_LOAD = 21,
+      DUCKDB_STATEMENT_TYPE_RELATION = 22,
+      DUCKDB_STATEMENT_TYPE_EXTENSION = 23,
+      DUCKDB_STATEMENT_TYPE_LOGICAL_PLAN = 24,
+      DUCKDB_STATEMENT_TYPE_ATTACH = 25,
+      DUCKDB_STATEMENT_TYPE_DETACH = 26,
+      DUCKDB_STATEMENT_TYPE_MULTI = 27,
+    } duckdb_statement_type;
+
     // Error category enumeration (as of v1.5.4)
     typedef enum duckdb_error_type {
       DUCKDB_ERROR_INVALID = 0,
@@ -118,6 +150,17 @@ if not pcall(ffi.typeof, 'duckdb_database') then
     typedef void *duckdb_vector;
     typedef void *duckdb_logical_type;
     typedef void *duckdb_prepared_statement;
+    typedef void *duckdb_extracted_statements;
+    typedef void *duckdb_pending_result;
+    typedef void *duckdb_appender;
+
+    // Pending execution state (drives task-by-task execution)
+    typedef enum {
+      DUCKDB_PENDING_RESULT_READY = 0,
+      DUCKDB_PENDING_RESULT_NOT_READY = 1,
+      DUCKDB_PENDING_ERROR = 2,
+      DUCKDB_PENDING_NO_TASKS_AVAILABLE = 3
+    } duckdb_pending_state;
 
     // LIST metadata entry (offset + length into the child vector)
     typedef struct { uint64_t offset; uint64_t length; } duckdb_list_entry;
@@ -172,6 +215,9 @@ if not pcall(ffi.typeof, 'duckdb_database') then
     // Result error handling
     const char* duckdb_result_error(duckdb_result* result);
     duckdb_error_type duckdb_result_error_type(duckdb_result* result);
+
+    // Statement kind that produced this result (SELECT vs DDL/DML etc.)
+    duckdb_statement_type duckdb_result_statement_type(duckdb_result result);
 
     // Result metadata accessors
     const char* duckdb_column_name(duckdb_result* result, idx_t col);
@@ -228,6 +274,7 @@ if not pcall(ffi.typeof, 'duckdb_database') then
     // Prepared statements
     duckdb_state duckdb_prepare(duckdb_connection connection, const char* query, duckdb_prepared_statement* out_prepared_statement);
     void duckdb_destroy_prepare(duckdb_prepared_statement* prepared_statement);
+    const char* duckdb_prepare_error(duckdb_prepared_statement prepared_statement);
     duckdb_state duckdb_bind_boolean(duckdb_prepared_statement prepared_statement, idx_t param_idx, bool val);
     duckdb_state duckdb_bind_int8(duckdb_prepared_statement prepared_statement, idx_t param_idx, int8_t val);
     duckdb_state duckdb_bind_int16(duckdb_prepared_statement prepared_statement, idx_t param_idx, int16_t val);
@@ -242,6 +289,38 @@ if not pcall(ffi.typeof, 'duckdb_database') then
     duckdb_state duckdb_bind_varchar(duckdb_prepared_statement prepared_statement, idx_t param_idx, const char* val);
     duckdb_state duckdb_bind_null(duckdb_prepared_statement prepared_statement, idx_t param_idx);
     duckdb_state duckdb_execute_prepared(duckdb_prepared_statement prepared_statement, duckdb_result* out_result);
+
+    // Parameter introspection / binding helpers
+    idx_t duckdb_nparams(duckdb_prepared_statement prepared_statement);
+    const char* duckdb_parameter_name(duckdb_prepared_statement prepared_statement, idx_t index);
+    duckdb_state duckdb_clear_bindings(duckdb_prepared_statement prepared_statement);
+
+    // Extract statements (split a multi-statement script into prepared statements)
+    idx_t duckdb_extract_statements(duckdb_connection connection, const char* query, duckdb_extracted_statements* out_extracted_statements);
+    duckdb_state duckdb_prepare_extracted_statement(duckdb_connection connection, duckdb_extracted_statements extracted_statements, idx_t index, duckdb_prepared_statement* out_prepared_statement);
+    const char* duckdb_extract_statements_error(duckdb_extracted_statements extracted_statements);
+    void duckdb_destroy_extracted(duckdb_extracted_statements* extracted_statements);
+
+    // Interrupt a running query (cancel from another point in the event loop)
+    void duckdb_interrupt(duckdb_connection connection);
+
+    // Pending result interface (task-by-task, non-blocking execution)
+    duckdb_state duckdb_pending_prepared(duckdb_prepared_statement prepared_statement, duckdb_pending_result* out_result);
+    void duckdb_destroy_pending(duckdb_pending_result* pending_result);
+    const char* duckdb_pending_error(duckdb_pending_result pending_result);
+    duckdb_pending_state duckdb_pending_execute_task(duckdb_pending_result pending_result);
+    duckdb_state duckdb_execute_pending(duckdb_pending_result pending_result, duckdb_result* out_result);
+    bool duckdb_pending_execution_is_finished(duckdb_pending_state pending_state);
+
+    // Appender (fast bulk insert into an existing table)
+    duckdb_state duckdb_appender_create(duckdb_connection connection, const char* schema, const char* table, duckdb_appender* out_appender);
+    const char* duckdb_appender_error(duckdb_appender appender);
+    duckdb_state duckdb_appender_flush(duckdb_appender appender);
+    duckdb_state duckdb_appender_close(duckdb_appender appender);
+    duckdb_state duckdb_appender_destroy(duckdb_appender* appender);
+    duckdb_state duckdb_appender_end_row(duckdb_appender appender);
+    duckdb_state duckdb_append_varchar(duckdb_appender appender, const char* val);
+    duckdb_state duckdb_append_null(duckdb_appender appender);
 
     // Memory management
     void duckdb_free(void* ptr);
@@ -418,6 +497,39 @@ M.error_type_names = {
   [40] = "AUTOLOAD",
   [41] = "SEQUENCE",
   [42] = "INVALID_CONFIGURATION",
+}
+
+---Statement type enum values (subset commonly surfaced in results)
+M.statement_type = {
+  INVALID = 0,
+  SELECT = 1,
+  INSERT = 2,
+  UPDATE = 3,
+  EXPLAIN = 4,
+  DELETE = 5,
+  CREATE = 7,
+  ALTER = 9,
+  COPY = 11,
+  DROP = 15,
+  PRAGMA = 17,
+  ATTACH = 25,
+  DETACH = 26,
+}
+
+---Human verb for a statement type, for "Query OK" messages. nil = no special verb.
+M.statement_verb = {
+  [2] = "inserted",
+  [3] = "updated",
+  [5] = "deleted",
+  [11] = "copied",
+}
+
+---Pending execution states (returned by duckdb_pending_execute_check_state)
+M.pending_state = {
+  READY = 0,
+  NOT_READY = 1,
+  ERROR = 2,
+  NO_TASKS_AVAILABLE = 3,
 }
 
 ---Extract string from duckdb_string_t structure

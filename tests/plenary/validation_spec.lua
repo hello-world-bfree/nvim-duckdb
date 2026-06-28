@@ -263,10 +263,10 @@ describe('DuckDB CSV Validation', function()
       assert.equals(1, result.row_count)
 
       local row = result.rows[1]
-      assert.is_nil(row[1])
-      assert.is_nil(row[2])
-      assert.is_nil(row[3])
-      assert.is_nil(row[4])
+      assert.is_true(query_module.is_null(row[1]))
+      assert.is_true(query_module.is_null(row[2]))
+      assert.is_true(query_module.is_null(row[3]))
+      assert.is_true(query_module.is_null(row[4]))
 
       query_module.close_connection(conn)
     end)

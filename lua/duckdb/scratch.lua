@@ -76,7 +76,21 @@ function M.execute_at_cursor(bufnr)
   end
 
   local duckdb = require("duckdb")
-  duckdb.query(query)
+  duckdb.query_async(query)
+end
+
+---Execute the entire scratch buffer as a multi-statement script.
+---Runs every `;`-separated statement in order; the last result is displayed.
+---@param bufnr number
+function M.execute_buffer(bufnr)
+  local script = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  if script:match("^%s*$") then
+    vim.notify("[DuckDB] Scratch buffer is empty", vim.log.levels.WARN)
+    return
+  end
+
+  local duckdb = require("duckdb")
+  duckdb.query_script_async(script)
 end
 
 ---Open or focus the scratch buffer
@@ -106,6 +120,7 @@ function M.open(config)
     if file then
       file:write("-- DuckDB Scratch Buffer\n")
       file:write("-- Press <CR> to execute the statement under cursor\n")
+      file:write("-- Press <leader>r to run the whole buffer (all statements)\n")
       file:write("-- Statements are separated by semicolons or blank lines\n\n")
       file:write("SELECT * FROM buffer LIMIT 10;\n")
       file:close()
@@ -126,6 +141,10 @@ function M.open(config)
   vim.keymap.set("n", "<C-CR>", function()
     M.execute_at_cursor(scratch_bufnr)
   end, vim.tbl_extend("force", opts, { desc = "DuckDB: Execute statement" }))
+
+  vim.keymap.set("n", "<leader>r", function()
+    M.execute_buffer(scratch_bufnr)
+  end, vim.tbl_extend("force", opts, { desc = "DuckDB: Run whole buffer (all statements)" }))
 
   vim.api.nvim_create_autocmd("BufWritePost", {
     buffer = scratch_bufnr,

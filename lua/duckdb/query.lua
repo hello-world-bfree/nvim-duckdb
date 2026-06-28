@@ -39,6 +39,7 @@ end
 ---@field row_count number Number of rows
 ---@field column_count number Number of columns
 ---@field rows_changed number Number of rows affected (for DML)
+---@field statement_type number duckdb_statement_type enum (1=SELECT, 7=CREATE, ...)
 
 -- ============================================================================
 -- SQL Identifier Helpers
@@ -568,43 +569,34 @@ end
 -- Query Execution (Modern Data Chunk API)
 -- ============================================================================
 
----Execute a query and return results using modern data chunk API
----@param connection DuckDBConnection
----@param query string SQL query
----@return QueryResult? result
----@return string? error
-function M.execute_query(connection, query)
-  if not connection.conn then
-    return nil, "Connection is closed"
+---Build a classified error message from a populated duckdb_result.
+---@param result ffi.cdata* duckdb_result[1] with an error set
+---@return string
+local function result_error_message(result)
+  local error_msg = "Query failed"
+  local err_ptr = duckdb_ffi.C.duckdb_result_error(result)
+  if err_ptr ~= nil then
+    error_msg = ffi.string(err_ptr)
   end
-
-  if connection._closed then
-    return nil, "Connection is closed"
+  -- Classify the error by DuckDB's own error category for clearer diagnostics.
+  local err_type = tonumber(duckdb_ffi.C.duckdb_result_error_type(result))
+  local category = duckdb_ffi.error_type_names[err_type]
+  if category and category ~= "INVALID" then
+    error_msg = string.format("[%s] %s", category, error_msg)
   end
+  return error_msg
+end
 
-  local result = ffi.new("duckdb_result[1]")
-
-  local state = duckdb_ffi.C.duckdb_query(connection.conn[0], query, result)
-
-  if state ~= 0 then
-    local error_msg = "Query failed"
-    local err_ptr = duckdb_ffi.C.duckdb_result_error(result)
-    if err_ptr ~= nil then
-      error_msg = ffi.string(err_ptr)
-    end
-    -- Classify the error by DuckDB's own error category for clearer diagnostics.
-    local err_type = tonumber(duckdb_ffi.C.duckdb_result_error_type(result))
-    local category = duckdb_ffi.error_type_names[err_type]
-    if category and category ~= "INVALID" then
-      error_msg = string.format("[%s] %s", category, error_msg)
-    end
-    duckdb_ffi.C.duckdb_destroy_result(result)
-    return nil, error_msg
-  end
-
+---Collect a populated duckdb_result into a QueryResult and destroy it.
+---Shared by the synchronous and pending (async) execution paths.
+---@param result ffi.cdata* duckdb_result[1], already successfully executed
+---@return QueryResult
+local function collect_result(result)
   -- Extract column information
   local column_count = tonumber(duckdb_ffi.C.duckdb_column_count(result))
   local rows_changed = tonumber(duckdb_ffi.C.duckdb_rows_changed(result))
+  -- Authoritative statement kind (SELECT vs DDL/DML). Passed by value.
+  local statement_type = tonumber(duckdb_ffi.C.duckdb_result_statement_type(result[0]))
 
   -- Types that need the logical type for extraction (recursive / dictionary /
   -- scaled). These take the slower logical-type-driven path; everything else
@@ -705,7 +697,330 @@ function M.execute_query(connection, query)
     row_count = total_row_count,
     column_count = column_count,
     rows_changed = rows_changed,
+    statement_type = statement_type,
   }
+end
+
+---Guard a connection before execution. Returns an error string if unusable.
+---@param connection DuckDBConnection
+---@return string? error
+local function check_connection(connection)
+  if connection._closed or not connection.conn then
+    return "Connection is closed"
+  end
+  return nil
+end
+
+---Execute a query and return results using modern data chunk API.
+---Synchronous: blocks until the query completes. For long queries prefer
+---execute_query_async, which keeps the Neovim event loop responsive.
+---@param connection DuckDBConnection
+---@param query string SQL query
+---@return QueryResult? result
+---@return string? error
+function M.execute_query(connection, query)
+  local conn_err = check_connection(connection)
+  if conn_err then
+    return nil, conn_err
+  end
+
+  local result = ffi.new("duckdb_result[1]")
+  local state = duckdb_ffi.C.duckdb_query(connection.conn[0], query, result)
+  if state ~= 0 then
+    local error_msg = result_error_message(result)
+    duckdb_ffi.C.duckdb_destroy_result(result)
+    return nil, error_msg
+  end
+
+  return collect_result(result)
+end
+
+---Interrupt a query running on this connection (e.g. from execute_query_async).
+---Safe to call when no query is running. The interrupted query surfaces as an
+---INTERRUPT-category error in its callback.
+---@param connection DuckDBConnection
+function M.interrupt(connection)
+  if connection.conn and not connection._closed then
+    duckdb_ffi.C.duckdb_interrupt(connection.conn[0])
+  end
+end
+
+---Drive an already-prepared statement to completion via the pending-result
+---interface, off the main loop. Takes ownership of `prepared` and destroys it
+---(along with the pending result) when finished.
+---@param connection DuckDBConnection
+---@param prepared ffi.cdata* duckdb_prepared_statement[1], owned by this call
+---@param callback fun(result: QueryResult?, err: string?) Invoked on completion
+---@param interval integer Timer period in ms
+---@return boolean started False if the pending result could not be created
+local function drive_prepared_async(connection, prepared, callback, interval)
+  -- Create a pending result that we drive task-by-task.
+  local pending = ffi.new("duckdb_pending_result[1]")
+  local state = duckdb_ffi.C.duckdb_pending_prepared(prepared[0], pending)
+  if state ~= 0 then
+    local err_ptr = duckdb_ffi.C.duckdb_pending_error(pending[0])
+    local msg = err_ptr ~= nil and ffi.string(err_ptr) or "Failed to create pending result"
+    duckdb_ffi.C.duckdb_destroy_pending(pending)
+    duckdb_ffi.C.duckdb_destroy_prepare(prepared)
+    callback(nil, msg)
+    return false
+  end
+
+  local PS = duckdb_ffi.pending_state
+  local timer = vim.loop.new_timer()
+  local finished = false
+
+  -- Tear down FFI handles exactly once, regardless of success/error/cancel.
+  local function cleanup()
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    duckdb_ffi.C.duckdb_destroy_pending(pending)
+    duckdb_ffi.C.duckdb_destroy_prepare(prepared)
+  end
+
+  -- Resolve once: guard against double-callback (e.g. cancel racing a tick).
+  local function finish(result, err)
+    if finished then
+      return
+    end
+    finished = true
+    cleanup()
+    callback(result, err)
+  end
+
+  timer:start(0, interval, function()
+    if finished then
+      return
+    end
+
+    -- Run a single execution task. Its RETURN VALUE is the authoritative state:
+    -- duckdb_pending_execute_check_state can sit at NO_TASKS_AVAILABLE while the
+    -- query is still progressing, so we key off the task return + is_finished.
+    local pstate = duckdb_ffi.C.duckdb_pending_execute_task(pending[0])
+
+    if tonumber(pstate) == PS.ERROR then
+      local err_ptr = duckdb_ffi.C.duckdb_pending_error(pending[0])
+      local msg = err_ptr ~= nil and ffi.string(err_ptr) or "Query failed"
+      -- Marshal back onto the main loop before touching Neovim state.
+      vim.schedule(function()
+        finish(nil, msg)
+      end)
+    elseif duckdb_ffi.C.duckdb_pending_execution_is_finished(pstate) then
+      -- Execution done; materialize the result (synchronous, fast).
+      local result = ffi.new("duckdb_result[1]")
+      local exec_state = duckdb_ffi.C.duckdb_execute_pending(pending[0], result)
+      if exec_state ~= 0 then
+        local msg = result_error_message(result)
+        duckdb_ffi.C.duckdb_destroy_result(result)
+        vim.schedule(function()
+          finish(nil, msg)
+        end)
+      else
+        vim.schedule(function()
+          if finished then
+            duckdb_ffi.C.duckdb_destroy_result(result)
+            return
+          end
+          finish(collect_result(result), nil)
+        end)
+      end
+    end
+    -- NOT_READY / NO_TASKS_AVAILABLE: keep ticking.
+  end)
+
+  return true
+end
+
+---Execute a query without blocking the Neovim event loop.
+---
+---Drives DuckDB's pending-result interface from a libuv timer: each tick runs
+---one execution task, yields back to the loop, and reschedules until the result
+---is ready. Result collection (chunk fetch) still happens synchronously once
+---execution finishes — that part is fast relative to query planning/scanning.
+---
+---The query is cancellable mid-flight via M.interrupt(connection).
+---
+---@param connection DuckDBConnection
+---@param query string SQL query
+---@param callback fun(result: QueryResult?, err: string?) Invoked on completion
+---@param opts? { interval_ms?: integer } interval_ms: timer period (default 5)
+---@return fun()|nil cancel A function that interrupts the in-flight query, or nil if setup failed
+function M.execute_query_async(connection, query, callback, opts)
+  opts = opts or {}
+  local interval = opts.interval_ms or 5
+
+  local conn_err = check_connection(connection)
+  if conn_err then
+    callback(nil, conn_err)
+    return nil
+  end
+
+  -- Prepare the statement (cheap; surfaces parse/bind errors immediately).
+  local prepared = ffi.new("duckdb_prepared_statement[1]")
+  local state = duckdb_ffi.C.duckdb_prepare(connection.conn[0], query, prepared)
+  if state ~= 0 then
+    local err_ptr = duckdb_ffi.C.duckdb_prepare_error(prepared[0])
+    local msg = err_ptr ~= nil and ffi.string(err_ptr) or "Failed to prepare statement"
+    duckdb_ffi.C.duckdb_destroy_prepare(prepared)
+    callback(nil, msg)
+    return nil
+  end
+
+  if not drive_prepared_async(connection, prepared, callback, interval) then
+    return nil
+  end
+
+  -- Cancel handle: interrupt the running query. The next tick observes the
+  -- resulting error state and resolves via the normal error path.
+  return function()
+    M.interrupt(connection)
+  end
+end
+
+---Execute a parameterized query, binding `values` positionally to its
+---parameters ($1..$N or ?), without blocking the Neovim event loop.
+---
+---All values are bound as VARCHAR; DuckDB casts them to each parameter's target
+---type (e.g. '5' -> INTEGER). A value of nil (or the M.NULL sentinel) binds SQL
+---NULL. The number of values must match the statement's parameter count.
+---
+---@param connection DuckDBConnection
+---@param query string SQL query containing parameters
+---@param values table<any> Positional parameter values (1-based)
+---@param callback fun(result: QueryResult?, err: string?) Invoked on completion
+---@param opts? { interval_ms?: integer }
+---@return fun()|nil cancel Interrupts the in-flight query, or nil on setup failure
+function M.execute_query_with_params_async(connection, query, values, callback, opts)
+  opts = opts or {}
+  local interval = opts.interval_ms or 5
+
+  local conn_err = check_connection(connection)
+  if conn_err then
+    callback(nil, conn_err)
+    return nil
+  end
+
+  local prepared = ffi.new("duckdb_prepared_statement[1]")
+  local state = duckdb_ffi.C.duckdb_prepare(connection.conn[0], query, prepared)
+  if state ~= 0 then
+    local err_ptr = duckdb_ffi.C.duckdb_prepare_error(prepared[0])
+    local msg = err_ptr ~= nil and ffi.string(err_ptr) or "Failed to prepare statement"
+    duckdb_ffi.C.duckdb_destroy_prepare(prepared)
+    callback(nil, msg)
+    return nil
+  end
+
+  -- Validate parameter count up front for a clear error.
+  local nparams = tonumber(duckdb_ffi.C.duckdb_nparams(prepared[0]))
+  if nparams ~= #values then
+    duckdb_ffi.C.duckdb_destroy_prepare(prepared)
+    callback(nil, string.format("Query has %d parameter(s) but %d value(s) supplied", nparams, #values))
+    return nil
+  end
+
+  -- Bind each value positionally (parameter indices are 1-based).
+  for i = 1, nparams do
+    local v = values[i]
+    local bind_state
+    if v == nil or v == M.NULL then
+      bind_state = duckdb_ffi.C.duckdb_bind_null(prepared[0], i)
+    else
+      bind_state = duckdb_ffi.C.duckdb_bind_varchar(prepared[0], i, tostring(v))
+    end
+    if bind_state ~= 0 then
+      duckdb_ffi.C.duckdb_destroy_prepare(prepared)
+      callback(nil, string.format("Failed to bind parameter %d", i))
+      return nil
+    end
+  end
+
+  if not drive_prepared_async(connection, prepared, callback, interval) then
+    return nil
+  end
+
+  return function()
+    M.interrupt(connection)
+  end
+end
+
+---Execute a multi-statement SQL script without blocking the Neovim event loop.
+---
+---Splits the script into individual statements via duckdb_extract_statements,
+---then prepares and executes each one in order. Statements run sequentially:
+---statement i+1 starts only after statement i finishes, so earlier DDL/DML is
+---visible to later statements (e.g. CREATE TABLE then SELECT). The callback
+---receives the LAST statement's result; if any statement fails, execution stops
+---and the error is reported.
+---
+---Cancellable mid-flight via M.interrupt(connection); the in-progress statement
+---surfaces as an INTERRUPT error and the chain stops.
+---
+---@param connection DuckDBConnection
+---@param script string One or more `;`-separated SQL statements
+---@param callback fun(result: QueryResult?, err: string?, info: { statement_count: integer, executed: integer }?) Invoked on completion
+---@param opts? { interval_ms?: integer }
+---@return fun()|nil cancel Interrupts the in-flight statement, or nil on setup failure
+function M.execute_script_async(connection, script, callback, opts)
+  opts = opts or {}
+  local interval = opts.interval_ms or 5
+
+  local conn_err = check_connection(connection)
+  if conn_err then
+    callback(nil, conn_err)
+    return nil
+  end
+
+  -- Split the script into statements. Returns the statement count (0 on error).
+  local extracted = ffi.new("duckdb_extracted_statements[1]")
+  local count = tonumber(duckdb_ffi.C.duckdb_extract_statements(connection.conn[0], script, extracted))
+  if count == 0 then
+    local err_ptr = duckdb_ffi.C.duckdb_extract_statements_error(extracted[0])
+    local msg = err_ptr ~= nil and ffi.string(err_ptr) or "Failed to parse script"
+    duckdb_ffi.C.duckdb_destroy_extracted(extracted)
+    callback(nil, msg)
+    return nil
+  end
+
+  -- Run statement `index` (0-based). On success, recurse to the next; on the
+  -- last statement, deliver its result. Each statement is prepared from the
+  -- extracted set, then driven via the shared pending-result machinery.
+  local function run_statement(index)
+    local prepared = ffi.new("duckdb_prepared_statement[1]")
+    local state = duckdb_ffi.C.duckdb_prepare_extracted_statement(connection.conn[0], extracted[0], index, prepared)
+    if state ~= 0 then
+      local err_ptr = duckdb_ffi.C.duckdb_prepare_error(prepared[0])
+      local msg = err_ptr ~= nil and ffi.string(err_ptr)
+        or string.format("Failed to prepare statement %d/%d", index + 1, count)
+      duckdb_ffi.C.duckdb_destroy_prepare(prepared)
+      duckdb_ffi.C.duckdb_destroy_extracted(extracted)
+      callback(nil, msg, { statement_count = count, executed = index })
+      return
+    end
+
+    drive_prepared_async(connection, prepared, function(result, err)
+      if err then
+        duckdb_ffi.C.duckdb_destroy_extracted(extracted)
+        callback(nil, err, { statement_count = count, executed = index })
+        return
+      end
+      if index + 1 < count then
+        -- More statements remain; intermediate results are discarded.
+        run_statement(index + 1)
+      else
+        -- Last statement: deliver its result.
+        duckdb_ffi.C.duckdb_destroy_extracted(extracted)
+        callback(result, nil, { statement_count = count, executed = count })
+      end
+    end, interval)
+  end
+
+  run_statement(0)
+
+  return function()
+    M.interrupt(connection)
+  end
 end
 
 -- ============================================================================
@@ -810,6 +1125,75 @@ end
 -- Buffer Query Execution
 -- ============================================================================
 
+---Load all buffers referenced by a query into a connection and rewrite the
+---query to reference the resulting table names. Synchronous; this is local
+---file/buffer I/O and is fast relative to query execution.
+---@param conn DuckDBConnection
+---@param query string SQL query
+---@param buffer_identifier string|number|nil Buffer identifier
+---@return string processed_query Query with buffer() references substituted
+local function prepare_buffer_query(conn, query, buffer_identifier)
+  -- Extract buffer references from query
+  local identifiers = buffer_module.extract_buffer_references(query)
+
+  -- If no buffer references found, use provided identifier or current buffer
+  if #identifiers == 0 then
+    identifiers = { buffer_identifier or vim.api.nvim_get_current_buf() }
+  end
+
+  -- Load all referenced buffers
+  local loaded_tables = {}
+  for _, id in ipairs(identifiers) do
+    local buffer_info, buf_err = buffer_module.get_buffer_info(id)
+    if not buffer_info then
+      error(buf_err)
+    end
+
+    -- Validate content
+    local valid, val_err = buffer_module.validate_content(buffer_info.content, buffer_info.format)
+    if not valid then
+      error(string.format("Invalid %s content: %s", buffer_info.format, val_err))
+    end
+
+    -- Generate table name
+    local table_name
+    if type(id) == "string" then
+      table_name = id:gsub("[^%w_]", "_")
+    else
+      local basename = vim.fn.fnamemodify(buffer_info.name, ":t:r")
+      table_name = basename ~= "" and basename or "buffer"
+    end
+
+    -- Load buffer data
+    local load_ok, load_err = M.load_buffer_data(conn, table_name, buffer_info)
+    if not load_ok then
+      error(load_err)
+    end
+
+    table.insert(loaded_tables, table_name)
+  end
+
+  -- Replace buffer() references with actual table names in query
+  local processed_query = query
+  for i, id in ipairs(identifiers) do
+    local quoted_name = quote_identifier(loaded_tables[i])
+    -- Replace buffer('name') or buffer(num) with quoted table name
+    if type(id) == "string" then
+      processed_query =
+        processed_query:gsub("buffer%s*%(%s*['\"]" .. id:gsub("[%-%.]", "%%%1") .. "['\"]%s*%)", quoted_name)
+    else
+      processed_query = processed_query:gsub("buffer%s*%(%s*" .. id .. "%s*%)", quoted_name)
+    end
+  end
+
+  -- Replace standalone 'buffer' references if we loaded a single table
+  if #loaded_tables == 1 then
+    processed_query = processed_query:gsub("%f[%w]buffer%f[%W]", quote_identifier(loaded_tables[1]))
+  end
+
+  return processed_query
+end
+
 ---Execute query on buffer(s)
 ---@param query string SQL query
 ---@param buffer_identifier string|number|nil Buffer identifier
@@ -824,63 +1208,7 @@ function M.query_buffer(query, buffer_identifier)
 
   -- Ensure cleanup happens
   local success, result, error_msg = pcall(function()
-    -- Extract buffer references from query
-    local identifiers = buffer_module.extract_buffer_references(query)
-
-    -- If no buffer references found, use provided identifier or current buffer
-    if #identifiers == 0 then
-      identifiers = { buffer_identifier or vim.api.nvim_get_current_buf() }
-    end
-
-    -- Load all referenced buffers
-    local loaded_tables = {}
-    for _, id in ipairs(identifiers) do
-      local buffer_info, buf_err = buffer_module.get_buffer_info(id)
-      if not buffer_info then
-        error(buf_err)
-      end
-
-      -- Validate content
-      local valid, val_err = buffer_module.validate_content(buffer_info.content, buffer_info.format)
-      if not valid then
-        error(string.format("Invalid %s content: %s", buffer_info.format, val_err))
-      end
-
-      -- Generate table name
-      local table_name
-      if type(id) == "string" then
-        table_name = id:gsub("[^%w_]", "_")
-      else
-        local basename = vim.fn.fnamemodify(buffer_info.name, ":t:r")
-        table_name = basename ~= "" and basename or "buffer"
-      end
-
-      -- Load buffer data
-      local load_ok, load_err = M.load_buffer_data(conn, table_name, buffer_info)
-      if not load_ok then
-        error(load_err)
-      end
-
-      table.insert(loaded_tables, table_name)
-    end
-
-    -- Replace buffer() references with actual table names in query
-    local processed_query = query
-    for i, id in ipairs(identifiers) do
-      local quoted_name = quote_identifier(loaded_tables[i])
-      -- Replace buffer('name') or buffer(num) with quoted table name
-      if type(id) == "string" then
-        processed_query =
-          processed_query:gsub("buffer%s*%(%s*['\"]" .. id:gsub("[%-%.]", "%%%1") .. "['\"]%s*%)", quoted_name)
-      else
-        processed_query = processed_query:gsub("buffer%s*%(%s*" .. id .. "%s*%)", quoted_name)
-      end
-    end
-
-    -- Replace standalone 'buffer' references if we loaded a single table
-    if #loaded_tables == 1 then
-      processed_query = processed_query:gsub("%f[%w]buffer%f[%W]", quote_identifier(loaded_tables[1]))
-    end
+    local processed_query = prepare_buffer_query(conn, query, buffer_identifier)
 
     -- Execute the query
     local query_result, query_err = M.execute_query(conn, processed_query)
@@ -898,6 +1226,139 @@ function M.query_buffer(query, buffer_identifier)
   end
 
   return result, error_msg
+end
+
+---Execute query on buffer(s) without blocking the Neovim event loop.
+---
+---Buffer loading is synchronous (fast local I/O); only the query execution is
+---driven asynchronously via the pending-result interface. The connection stays
+---open until execution completes, then is closed before the callback fires.
+---
+---@param query string SQL query
+---@param buffer_identifier string|number|nil Buffer identifier
+---@param callback fun(result: QueryResult?, err: string?) Invoked on completion
+---@param opts? { interval_ms?: integer } Forwarded to execute_query_async
+---@return DuckDBConnection? connection The live connection (for M.interrupt), or nil on setup failure
+function M.query_buffer_async(query, buffer_identifier, callback, opts)
+  local conn, err = M.create_connection()
+  if not conn then
+    callback(nil, err)
+    return nil
+  end
+
+  -- Buffer loading + query rewrite (synchronous, may raise via error()).
+  local ok, processed_query = pcall(prepare_buffer_query, conn, query, buffer_identifier)
+  if not ok then
+    M.close_connection(conn)
+    callback(nil, tostring(processed_query))
+    return nil
+  end
+
+  M.execute_query_async(conn, processed_query, function(result, query_err)
+    M.close_connection(conn)
+    callback(result, query_err)
+  end, opts)
+
+  return conn
+end
+
+---Like query_buffer_async, but the query carries positional parameters bound
+---from `values`. Buffer references are loaded/rewritten, then the parameterized
+---query runs against them.
+---@param query string SQL query with $1..$N / ? parameters
+---@param values table<any> Positional parameter values
+---@param buffer_identifier string|number|nil
+---@param callback fun(result: QueryResult?, err: string?)
+---@param opts? { interval_ms?: integer }
+---@return DuckDBConnection? connection
+function M.query_buffer_with_params_async(query, values, buffer_identifier, callback, opts)
+  local conn, err = M.create_connection()
+  if not conn then
+    callback(nil, err)
+    return nil
+  end
+
+  local ok, processed_query = pcall(prepare_buffer_query, conn, query, buffer_identifier)
+  if not ok then
+    M.close_connection(conn)
+    callback(nil, tostring(processed_query))
+    return nil
+  end
+
+  M.execute_query_with_params_async(conn, processed_query, values, function(result, query_err)
+    M.close_connection(conn)
+    callback(result, query_err)
+  end, opts)
+
+  return conn
+end
+
+-- ============================================================================
+-- Appender (fast bulk insert)
+-- ============================================================================
+
+---Bulk-insert rows into an existing table using DuckDB's appender API.
+---
+---Every cell is appended as VARCHAR (the M.NULL sentinel or Lua nil appends SQL
+---NULL); DuckDB casts to each column's declared type. The target table must
+---already exist with a column count matching each row's length. This is far
+---faster than generating one INSERT per row.
+---
+---Synchronous: the appender is an in-memory fast path, not a planned query.
+---
+---@param connection DuckDBConnection
+---@param table_name string Existing target table
+---@param rows table<table> Array of rows; each row an array of cell values
+---@return integer? appended Number of rows appended, or nil on error
+---@return string? error
+function M.append_rows(connection, table_name, rows)
+  local conn_err = check_connection(connection)
+  if conn_err then
+    return nil, conn_err
+  end
+
+  local appender = ffi.new("duckdb_appender[1]")
+  -- schema = nil selects the default schema.
+  local state = duckdb_ffi.C.duckdb_appender_create(connection.conn[0], nil, table_name, appender)
+  if state ~= 0 then
+    local err_ptr = duckdb_ffi.C.duckdb_appender_error(appender[0])
+    local msg = err_ptr ~= nil and ffi.string(err_ptr) or "Failed to create appender"
+    duckdb_ffi.C.duckdb_appender_destroy(appender)
+    return nil, msg
+  end
+
+  -- Append every cell. On any failure, surface the appender's error and bail.
+  local function fail()
+    local err_ptr = duckdb_ffi.C.duckdb_appender_error(appender[0])
+    local msg = err_ptr ~= nil and ffi.string(err_ptr) or "Append failed"
+    duckdb_ffi.C.duckdb_appender_destroy(appender)
+    return nil, msg
+  end
+
+  for _, row in ipairs(rows) do
+    for _, cell in ipairs(row) do
+      local s
+      if cell == nil or cell == M.NULL then
+        s = duckdb_ffi.C.duckdb_append_null(appender[0])
+      else
+        s = duckdb_ffi.C.duckdb_append_varchar(appender[0], tostring(cell))
+      end
+      if s ~= 0 then
+        return fail()
+      end
+    end
+    if duckdb_ffi.C.duckdb_appender_end_row(appender[0]) ~= 0 then
+      return fail()
+    end
+  end
+
+  -- Flush commits the appended rows; check for constraint/cast errors here too.
+  if duckdb_ffi.C.duckdb_appender_flush(appender[0]) ~= 0 then
+    return fail()
+  end
+
+  duckdb_ffi.C.duckdb_appender_destroy(appender)
+  return #rows, nil
 end
 
 return M

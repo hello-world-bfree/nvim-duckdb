@@ -110,8 +110,27 @@ function M.format_results(result, options)
 
   local lines = {}
 
+  local ffi_mod = require("duckdb.ffi")
+  local st = result.statement_type
+  local ST = ffi_mod.statement_type
+
+  -- DML (INSERT/UPDATE/DELETE/COPY) returns a one-row "Count" result. Report it
+  -- as an affected-rows message instead of rendering that count as a table.
+  local verb = st and ffi_mod.statement_verb[st]
+  if verb then
+    table.insert(lines, string.format("Query OK, %d row(s) %s", result.rows_changed, verb))
+    return lines
+  end
+
   if result.row_count == 0 then
-    if result.rows_changed > 0 then
+    if st == ST.SELECT then
+      -- A SELECT that returned no rows: genuinely an empty result set.
+      table.insert(lines, "Empty result set")
+    elseif st ~= nil and st ~= ST.INVALID then
+      -- DDL (CREATE/DROP/ALTER/...): report plain success.
+      table.insert(lines, "Query OK")
+    elseif result.rows_changed > 0 then
+      -- Fallback for results without a statement type (older path).
       table.insert(lines, string.format("Query OK, %d row(s) affected", result.rows_changed))
     else
       table.insert(lines, "Empty result set")

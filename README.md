@@ -8,6 +8,9 @@ A Neovim plugin that integrates DuckDB via LuaJIT FFI to enable SQL queries on C
 
 ## Features
 
+- **Non-Blocking Queries**: Async execution with a progress spinner; cancel anytime
+- **Statement-Aware Results**: `SELECT` shows a table; `INSERT`/`UPDATE`/`DELETE` report rows affected; DDL reports `Query OK`
+- **Bulk Import**: Load delimited lines into a DuckDB table via the fast appender API
 - **Direct Buffer Queries**: Query CSV, JSON, and JSONL data without saving files
 - **Multi-Buffer Joins**: Query and join data across multiple buffers
 - **Query History**: Persistent history with search and re-execution
@@ -239,7 +242,11 @@ Complete reference for commands, keymaps, configuration, and API.
 
 | Command | Description |
 |---------|-------------|
-| `:DuckDB <query>` | Execute SQL query on buffer |
+| `:DuckDB <query>` | Execute SQL query on buffer (non-blocking) |
+| `:DuckDBScript` | Run the current buffer (or range) as a multi-statement script |
+| `:DuckDBParam <sql> -- <vals>` | Run a parameterized query with inline values |
+| `:DuckDBImport [table]` | Bulk-import delimited lines (header + rows) into a table |
+| `:DuckDBCancel` | Cancel the currently running query |
 | `:DuckDBSchema [buffer]` | Show buffer schema |
 | `:DuckDBBuffers` | List queryable buffers |
 | `:DuckDBValidate [buffer]` | Validate CSV/JSON with inline diagnostics |
@@ -262,6 +269,7 @@ Complete reference for commands, keymaps, configuration, and API.
 | `<leader>ds` | n | Show schema |
 | `<leader>dv` | n | Validate buffer |
 | `<leader>db` | n | List buffers |
+| `<leader>dc` | n | Cancel running query |
 | `<leader>dp` | n | Preview (LIMIT 100) |
 | `<leader>d1` | n | Preview (LIMIT 10) |
 | `<leader>d5` | n | Preview (LIMIT 50) |
@@ -292,6 +300,7 @@ Complete reference for commands, keymaps, configuration, and API.
 |-----|-------------|
 | `<CR>` | Execute statement at cursor |
 | `<C-CR>` | Execute statement at cursor |
+| `<leader>r` | Run whole buffer (all statements) |
 
 ### Configuration
 
@@ -344,7 +353,44 @@ duckdb.query_prompt()
 
 -- Execute visual selection
 duckdb.query_visual()
+
+-- Execute asynchronously (non-blocking). Same options as duckdb.query.
+-- Shows a progress spinner and is cancellable. Returns nothing; results are
+-- displayed when the query completes.
+duckdb.query_async('SELECT * FROM buffer', { display = 'float' })
+
+-- Run a multi-statement SQL script (CREATE/INSERT/SELECT/...). Statements run
+-- in order on one connection; the last statement's result is displayed.
+duckdb.query_script_async([[
+  CREATE TEMP TABLE t AS SELECT * FROM buffer;
+  SELECT count(*) FROM t;
+]])
+
+-- Parameterized query: values bind positionally to $1..$N / ? (as VARCHAR,
+-- DuckDB casts to the target type). Use the NULL sentinel for SQL NULL.
+duckdb.query_params_async('SELECT * FROM buffer WHERE score > $1', { '50' })
+
+-- Bulk-import delimited lines (first line = header) into a fresh table and show it.
+duckdb.import_lines_async({ 'id,name', '1,alice', '2,bob' }, { table_name = 'people' })
+
+-- Low-level: bulk-append rows into an existing table on your own connection
+-- (fast appender path; cells bound as VARCHAR, NULL sentinel for SQL NULL).
+local n, err = duckdb.append_rows(conn, 'people', { { '3', 'carol' } })
+
+-- Cancel the in-flight async query (if any). Returns true if one was running.
+duckdb.cancel()
 ```
+
+> **Async by default:** the `:DuckDB` command, all preview keymaps, and the
+> query prompt/visual mappings run via `query_async`, so a long-running query
+> never freezes Neovim. A spinner shows while it runs; cancel with `<leader>dc`
+> or `:DuckDBCancel`. The synchronous `duckdb.query` / `duckdb.query_as_table`
+> remain available for programmatic use where you need the result inline.
+>
+> **Multi-statement scripts:** `:DuckDBScript` (or `<leader>r` in the scratch
+> buffer) runs the whole buffer as a sequence of `;`-separated statements via
+> `query_script_async` — earlier statements (e.g. `CREATE`/`INSERT`) are visible
+> to later ones, and the final statement's result is displayed.
 
 #### Schema and Validation
 

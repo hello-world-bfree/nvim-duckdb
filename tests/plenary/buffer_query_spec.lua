@@ -133,7 +133,7 @@ describe('DuckDB Buffer Query', function()
       local result, query_err = query_module.execute_query(conn, 'SELECT NULL::VARCHAR as null_str')
       assert.is_nil(query_err)
       assert.equals(1, result.row_count)
-      assert.is_nil(result.rows[1][1])
+      assert.is_true(query_module.is_null(result.rows[1][1]))
 
       query_module.close_connection(conn)
     end)
