@@ -1361,4 +1361,57 @@ function M.append_rows(connection, table_name, rows)
   return #rows, nil
 end
 
+-- ============================================================================
+-- Query Introspection
+-- ============================================================================
+
+---List the tables a query references, using DuckDB's own parser.
+---
+---Returns the distinct table names the query reads from (e.g. for completion or
+---an unknown-table lint). Parsing happens in DuckDB, so it understands CTEs,
+---subqueries, and joins. Names are unqualified unless `qualified` is true.
+---
+---@param connection DuckDBConnection
+---@param query string SQL query to inspect
+---@param qualified boolean? Return schema-qualified names (default false)
+---@return table<string>? tables Distinct referenced table names, or nil on error
+---@return string? error
+function M.get_referenced_tables(connection, query, qualified)
+  local conn_err = check_connection(connection)
+  if conn_err then
+    return nil, conn_err
+  end
+
+  -- Returns a duckdb_value holding a LIST of VARCHAR. May raise a C++ exception
+  -- on an unparseable query, so guard the FFI call.
+  local ok, value = pcall(
+    duckdb_ffi.C.duckdb_get_table_names,
+    connection.conn[0],
+    query,
+    qualified and true or false
+  )
+  if not ok or value == nil then
+    return nil, "Failed to parse query for table names"
+  end
+
+  local tables = {}
+  local size = tonumber(duckdb_ffi.C.duckdb_get_list_size(value))
+  for i = 0, size - 1 do
+    local child = duckdb_ffi.C.duckdb_get_list_child(value, i)
+    if child ~= nil then
+      local name = take_owned_string(duckdb_ffi.C.duckdb_get_varchar(child))
+      local child_ptr = ffi.new("duckdb_value[1]", child)
+      duckdb_ffi.C.duckdb_destroy_value(child_ptr)
+      if name then
+        table.insert(tables, name)
+      end
+    end
+  end
+
+  local value_ptr = ffi.new("duckdb_value[1]", value)
+  duckdb_ffi.C.duckdb_destroy_value(value_ptr)
+
+  return tables, nil
+end
+
 return M

@@ -153,6 +153,7 @@ if not pcall(ffi.typeof, 'duckdb_database') then
     typedef void *duckdb_extracted_statements;
     typedef void *duckdb_pending_result;
     typedef void *duckdb_appender;
+    typedef void *duckdb_value;
 
     // Pending execution state (drives task-by-task execution)
     typedef enum {
@@ -270,6 +271,16 @@ if not pcall(ffi.typeof, 'duckdb_database') then
 
     // Library version
     const char *duckdb_library_version();
+
+    // Table-name introspection: which tables a query references.
+    // Returns a duckdb_value holding a LIST of VARCHAR.
+    duckdb_value duckdb_get_table_names(duckdb_connection connection, const char* query, bool qualified);
+
+    // duckdb_value accessors (for reading the LIST returned above)
+    void duckdb_destroy_value(duckdb_value* value);
+    idx_t duckdb_get_list_size(duckdb_value value);
+    duckdb_value duckdb_get_list_child(duckdb_value value, idx_t index);
+    char *duckdb_get_varchar(duckdb_value value);
 
     // Prepared statements
     duckdb_state duckdb_prepare(duckdb_connection connection, const char* query, duckdb_prepared_statement* out_prepared_statement);

@@ -63,6 +63,27 @@ end, {
   desc = "Cancel the currently running DuckDB query",
 })
 
+-- Create :DuckDBTables command (show which tables a query references)
+vim.api.nvim_create_user_command("DuckDBTables", function(args)
+  if args.args == "" then
+    vim.notify("[DuckDB] Usage: :DuckDBTables <query>", vim.log.levels.ERROR)
+    return
+  end
+  local tables, err = duckdb.get_referenced_tables(args.args)
+  if not tables then
+    vim.notify(string.format("[DuckDB] %s", err), vim.log.levels.ERROR)
+    return
+  end
+  if #tables == 0 then
+    vim.notify("[DuckDB] Query references no tables", vim.log.levels.INFO)
+  else
+    vim.notify("[DuckDB] Referenced tables: " .. table.concat(tables, ", "), vim.log.levels.INFO)
+  end
+end, {
+  nargs = "+",
+  desc = "List the tables referenced by a query",
+})
+
 -- Create :DuckDBParam command (parameterized query with inline values)
 -- Usage: :DuckDBParam SELECT * FROM buffer WHERE id > $1 -- 42
 -- Everything before " -- " is the SQL; whitespace-separated tokens after are
@@ -86,6 +107,40 @@ vim.api.nvim_create_user_command("DuckDBParam", function(args)
 end, {
   nargs = "+",
   desc = "Run a parameterized query: <sql> -- <values...>",
+})
+
+-- Create :DuckDBSession command (query the persistent session database)
+vim.api.nvim_create_user_command("DuckDBSession", function(args)
+  if args.args == "" then
+    vim.notify('[DuckDB] Usage: :DuckDBSession <query>', vim.log.levels.ERROR)
+    return
+  end
+  duckdb.query_session_async(args.args)
+end, {
+  nargs = "+",
+  desc = "Run a query against the persistent session database",
+})
+
+-- Create :DuckDBSessionInfo command (path + tables in the session DB)
+vim.api.nvim_create_user_command("DuckDBSessionInfo", function()
+  duckdb.session_info()
+end, {
+  desc = "Show the session database path and its tables",
+})
+
+-- Create :DuckDBSessionReset command (delete the session DB file)
+vim.api.nvim_create_user_command("DuckDBSessionReset", function()
+  duckdb.session_reset()
+end, {
+  desc = "Reset (delete) the persistent session database",
+})
+
+-- Close the session connection cleanly when Neovim exits.
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  group = vim.api.nvim_create_augroup("DuckDBSession", { clear = true }),
+  callback = function()
+    duckdb.close_session()
+  end,
 })
 
 -- Create :DuckDBImport command (bulk-load delimited lines via the appender)

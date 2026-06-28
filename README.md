@@ -11,6 +11,7 @@ A Neovim plugin that integrates DuckDB via LuaJIT FFI to enable SQL queries on C
 - **Non-Blocking Queries**: Async execution with a progress spinner; cancel anytime
 - **Statement-Aware Results**: `SELECT` shows a table; `INSERT`/`UPDATE`/`DELETE` report rows affected; DDL reports `Query OK`
 - **Bulk Import**: Load delimited lines into a DuckDB table via the fast appender API
+- **Persistent Session DB**: Opt-in on-disk database for imports/`CREATE` that survives restarts (buffer queries stay ephemeral)
 - **Direct Buffer Queries**: Query CSV, JSON, and JSONL data without saving files
 - **Multi-Buffer Joins**: Query and join data across multiple buffers
 - **Query History**: Persistent history with search and re-execution
@@ -246,6 +247,10 @@ Complete reference for commands, keymaps, configuration, and API.
 | `:DuckDBScript` | Run the current buffer (or range) as a multi-statement script |
 | `:DuckDBParam <sql> -- <vals>` | Run a parameterized query with inline values |
 | `:DuckDBImport [table]` | Bulk-import delimited lines (header + rows) into a table |
+| `:DuckDBTables <query>` | List the tables a query references (via DuckDB's parser) |
+| `:DuckDBSession <query>` | Query the persistent session database |
+| `:DuckDBSessionInfo` | Show the session DB path and its tables |
+| `:DuckDBSessionReset` | Delete the persistent session database |
 | `:DuckDBCancel` | Cancel the currently running query |
 | `:DuckDBSchema [buffer]` | Show buffer schema |
 | `:DuckDBBuffers` | List queryable buffers |
@@ -318,6 +323,9 @@ require('duckdb').setup({
   -- Scratch buffer
   scratch_path = nil,        -- Custom path (nil = stdpath('cache')/duckdb_scratch.sql)
 
+  -- Persistent session database
+  session_path = nil,        -- Custom path (nil = stdpath('data')/duckdb_session.db)
+
   -- Hover/inline features
   hover_stats = true,        -- Enable K mapping for column stats
   inline_preview = true,     -- Enable inline result previews
@@ -377,6 +385,10 @@ duckdb.import_lines_async({ 'id,name', '1,alice', '2,bob' }, { table_name = 'peo
 -- (fast appender path; cells bound as VARCHAR, NULL sentinel for SQL NULL).
 local n, err = duckdb.append_rows(conn, 'people', { { '3', 'carol' } })
 
+-- Inspect which tables a query references (DuckDB's parser; handles CTEs/joins).
+local tables = duckdb.get_referenced_tables('SELECT * FROM a JOIN b ON a.x = b.x')
+-- -> { 'a', 'b' }
+
 -- Cancel the in-flight async query (if any). Returns true if one was running.
 duckdb.cancel()
 ```
@@ -391,6 +403,33 @@ duckdb.cancel()
 > buffer) runs the whole buffer as a sequence of `;`-separated statements via
 > `query_script_async` — earlier statements (e.g. `CREATE`/`INSERT`) are visible
 > to later ones, and the final statement's result is displayed.
+>
+> **Ephemeral vs. session:** ordinary buffer queries (`:DuckDB`, the preview
+> keymaps, validate/schema/summary) run on a throwaway in-memory database, so
+> the CSV/JSON data they load never sticks around. Things you *deliberately*
+> persist — `:DuckDBImport`, the scratch buffer's `<leader>r`, and anything you
+> run via `:DuckDBSession` — land in an on-disk **session database** that
+> survives Neovim restarts. Query it with `:DuckDBSession <sql>`, inspect it with
+> `:DuckDBSessionInfo`, and wipe it with `:DuckDBSessionReset`. The file lives at
+> `stdpath('data')/duckdb_session.db` by default (override with `session_path` in
+> `setup`).
+
+#### Session Database
+
+```lua
+-- Query the persistent session database (no buffer() substitution).
+duckdb.query_session_async('SELECT * FROM people')
+
+-- Import lands in the session DB by default (pass target = 'ephemeral' to opt out).
+duckdb.import_lines_async({ 'id,name', '1,alice' }, { table_name = 'people' })
+
+-- Run a script against the session DB so its CREATE/INSERT effects persist.
+duckdb.query_script_async('CREATE TABLE t AS SELECT 1', { target = 'session' })
+
+-- Inspect (path + tables) or reset (delete the on-disk file).
+duckdb.session_info()
+duckdb.session_reset()
+```
 
 #### Schema and Validation
 
@@ -519,7 +558,7 @@ local csv = actions.format_csv(result)
 ### Requirements
 
 - Neovim 0.7+ (includes LuaJIT)
-- DuckDB 0.10.0+ shared library (`libduckdb`)
+- DuckDB 1.5.0+ shared library (`libduckdb`)
 
 ### Installing DuckDB
 

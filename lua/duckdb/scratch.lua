@@ -81,6 +81,7 @@ end
 
 ---Execute the entire scratch buffer as a multi-statement script.
 ---Runs every `;`-separated statement in order; the last result is displayed.
+---Runs against the persistent session DB so CREATE/INSERT side effects persist.
 ---@param bufnr number
 function M.execute_buffer(bufnr)
   local script = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
@@ -90,7 +91,7 @@ function M.execute_buffer(bufnr)
   end
 
   local duckdb = require("duckdb")
-  duckdb.query_script_async(script)
+  duckdb.query_script_async(script, { target = "session" })
 end
 
 ---Open or focus the scratch buffer

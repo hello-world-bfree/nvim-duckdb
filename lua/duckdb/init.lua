@@ -33,7 +33,51 @@ M.config = {
   inline_preview = true,
   inline_preview_debounce_ms = 500,
   hover_stats = true,
+  session_path = nil,
 }
+
+-- The persistent on-disk session connection, opened lazily and reused across
+-- calls so that imports / CREATE / scratch results survive between queries (and
+-- across Neovim restarts). Ephemeral commands do NOT use this — they keep using
+-- throwaway in-memory connections so transient buffer data never pollutes it.
+---@type DuckDBConnection?
+local session_conn = nil
+
+---Resolve the on-disk path backing the session database.
+---@return string
+local function session_db_path()
+  return M.config.session_path or (vim.fn.stdpath("data") .. "/duckdb_session.db")
+end
+
+---Open (once) and return the persistent session connection.
+---@return DuckDBConnection? connection
+---@return string? error
+function M.session_connection()
+  if session_conn and not session_conn._closed then
+    return session_conn
+  end
+
+  local path = session_db_path()
+  local dir = vim.fn.fnamemodify(path, ":h")
+  if vim.fn.isdirectory(dir) == 0 then
+    vim.fn.mkdir(dir, "p")
+  end
+
+  local conn, err = query_module.create_connection(path)
+  if not conn then
+    return nil, err
+  end
+  session_conn = conn
+  return session_conn
+end
+
+---Close the session connection if open (called on VimLeave).
+function M.close_session()
+  if session_conn and not session_conn._closed then
+    query_module.close_connection(session_conn)
+  end
+  session_conn = nil
+end
 
 ---Setup plugin with user configuration
 ---@param opts DuckDBConfig?
@@ -341,24 +385,37 @@ end
 ---Execute a multi-statement SQL script asynchronously. Each `;`-separated
 ---statement runs in order on a shared connection; the LAST statement's result
 ---is displayed. Intended for the scratch buffer / running a whole SQL file.
+---
+---When opts.target == "session", the script runs on the persistent on-disk
+---session connection, so CREATE/INSERT side effects survive between queries.
+---Otherwise a throwaway in-memory connection is used and discarded.
 ---@param script string One or more SQL statements
----@param opts table? Options (same as M.query)
+---@param opts table? Options (same as M.query) plus optional `target = "session"`
 function M.query_script_async(script, opts)
   opts = opts or {}
   if not async_preflight() then
     return
   end
 
-  -- Open a dedicated connection for the whole script and close it on completion.
-  local conn = query_module.create_connection()
+  -- Pick the connection. The session connection is long-lived and must NOT be
+  -- closed after the script; a fresh ephemeral one is closed on completion.
+  local use_session = opts.target == "session"
+  local conn, conn_err
+  if use_session then
+    conn, conn_err = M.session_connection()
+  else
+    conn, conn_err = query_module.create_connection()
+  end
   if not conn then
-    vim.notify("[DuckDB] Failed to open connection", vim.log.levels.ERROR)
+    vim.notify(string.format("[DuckDB] Failed to open connection: %s", conn_err or "unknown"), vim.log.levels.ERROR)
     return
   end
 
   run_async(function(on_complete)
     query_module.execute_script_async(conn, script, function(result, err, info)
-      query_module.close_connection(conn)
+      if not use_session then
+        query_module.close_connection(conn)
+      end
       -- Stash statement info on opts so on_result can surface it.
       opts._script_info = info
       on_complete(result, err)
@@ -422,15 +479,19 @@ function M.append_rows(connection, table_name, rows)
   return query_module.append_rows(connection, table_name, rows)
 end
 
----Import delimited lines into a fresh in-memory table and display it.
+---Import delimited lines into a table and display it.
 ---
 ---The first line is treated as a header (column names); the remaining lines are
 ---data rows. All columns are created as VARCHAR and bulk-loaded via the appender
 ---— much faster than per-row INSERTs. Use this to pull a visual selection or a
 ---raw delimited buffer into DuckDB for ad-hoc querying.
 ---
+---By default the import lands in the persistent session database, so you can
+---query it later (and across Neovim restarts). Pass opts.target = "ephemeral"
+---to import into a throwaway in-memory connection instead.
+---
 ---@param lines table<string> Delimited text lines (first = header)
----@param opts table? { delimiter?: string, table_name?: string } + display options
+---@param opts table? { delimiter?: string, table_name?: string, target?: string } + display options
 function M.import_lines_async(lines, opts)
   opts = opts or {}
   local delimiter = opts.delimiter or ","
@@ -456,48 +517,134 @@ function M.import_lines_async(lines, opts)
 
   local header = table.remove(rows, 1)
 
-  local conn, conn_err = query_module.create_connection()
+  -- Import persists in the session DB unless explicitly told to be ephemeral.
+  local use_session = opts.target ~= "ephemeral"
+  local conn, conn_err
+  if use_session then
+    conn, conn_err = M.session_connection()
+  else
+    conn, conn_err = query_module.create_connection()
+  end
   if not conn then
     vim.notify(string.format("[DuckDB] %s", conn_err), vim.log.levels.ERROR)
     return
   end
+  local function release()
+    if not use_session then
+      query_module.close_connection(conn)
+    end
+  end
 
-  -- Build CREATE TABLE with one VARCHAR column per header field.
+  -- Build CREATE OR REPLACE TABLE with one VARCHAR column per header field.
+  -- OR REPLACE lets a re-import overwrite an existing session table cleanly.
   local quoted_table = '"' .. table_name:gsub('"', '""') .. '"'
   local cols = {}
   for _, name in ipairs(header) do
     cols[#cols + 1] = '"' .. name:gsub('"', '""') .. '" VARCHAR'
   end
-  local create_sql = string.format("CREATE TABLE %s (%s)", quoted_table, table.concat(cols, ", "))
+  local create_sql = string.format("CREATE OR REPLACE TABLE %s (%s)", quoted_table, table.concat(cols, ", "))
 
   local _, create_err = query_module.execute_query(conn, create_sql)
   if create_err then
-    query_module.close_connection(conn)
+    release()
     vim.notify(string.format("[DuckDB] Failed to create table: %s", create_err), vim.log.levels.ERROR)
     return
   end
 
   local appended, append_err = query_module.append_rows(conn, table_name, rows)
   if not appended then
-    query_module.close_connection(conn)
+    release()
     vim.notify(string.format("[DuckDB] Import failed: %s", append_err), vim.log.levels.ERROR)
     return
   end
 
   -- Display the imported table.
   local result, query_err = query_module.execute_query(conn, "SELECT * FROM " .. quoted_table)
-  query_module.close_connection(conn)
+  release()
   if not result then
     vim.notify(string.format("[DuckDB] %s", query_err), vim.log.levels.ERROR)
     return
   end
 
-  vim.notify(string.format("[DuckDB] Imported %d rows into %s", appended, table_name), vim.log.levels.INFO)
+  vim.notify(
+    string.format(
+      "[DuckDB] Imported %d rows into %s%s",
+      appended,
+      table_name,
+      use_session and " (session)" or ""
+    ),
+    vim.log.levels.INFO
+  )
   ui_module.display_results(result, {
     max_rows = M.config.max_rows,
     max_col_width = M.config.max_col_width,
     title = string.format(" Imported: %s ", table_name),
   })
+end
+
+---Run a query against the persistent session database (where imports / CREATE
+---results live). No buffer() substitution — this queries the session DB's own
+---tables. The session connection stays open afterwards.
+---@param query string SQL query
+---@param opts table? Options (same as M.query)
+function M.query_session_async(query, opts)
+  opts = opts or {}
+  if not async_preflight() then
+    return
+  end
+
+  local conn, conn_err = M.session_connection()
+  if not conn then
+    vim.notify(string.format("[DuckDB] %s", conn_err or "Failed to open session"), vim.log.levels.ERROR)
+    return
+  end
+
+  run_async(function(on_complete)
+    -- Session connection is long-lived: do NOT close it in the callback.
+    return query_module.execute_query_async(conn, query, on_complete, { interval_ms = opts.interval_ms })
+  end, function(result, query_err, execution_time_ms)
+    if not result then
+      vim.notify(string.format("[DuckDB] Query failed: %s", query_err), vim.log.levels.ERROR)
+      return
+    end
+    display_result(result, query, execution_time_ms, opts)
+  end)
+end
+
+---Reset the session database: close the connection and delete the on-disk file,
+---so the next session call starts from an empty database.
+function M.session_reset()
+  M.close_session()
+  local path = session_db_path()
+  for _, p in ipairs({ path, path .. ".wal" }) do
+    if vim.fn.filereadable(p) == 1 then
+      local ok = pcall(os.remove, p)
+      if not ok then
+        vim.notify(string.format("[DuckDB] Could not remove %s", p), vim.log.levels.WARN)
+      end
+    end
+  end
+  vim.notify("[DuckDB] Session database reset", vim.log.levels.INFO)
+end
+
+---Show the session database path and the tables it currently holds.
+function M.session_info()
+  local conn, err = M.session_connection()
+  if not conn then
+    vim.notify(string.format("[DuckDB] %s", err or "Failed to open session"), vim.log.levels.ERROR)
+    return
+  end
+  local result = query_module.execute_query(conn, "SELECT table_name FROM duckdb_tables() ORDER BY table_name")
+  local lines = { "Session database: " .. session_db_path(), "" }
+  if result and result.row_count > 0 then
+    table.insert(lines, "Tables:")
+    for _, row in ipairs(result.rows) do
+      table.insert(lines, "  " .. tostring(row[1]))
+    end
+  else
+    table.insert(lines, "No tables yet.")
+  end
+  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
 end
 
 ---Query current buffer
@@ -645,6 +792,28 @@ function M.query_as_table(query, buffer_id)
   end
 
   return rows
+end
+
+---List the tables a query references (via DuckDB's parser). Understands CTEs,
+---subqueries, and joins; CTE aliases are not reported as tables.
+---@param query string SQL query to inspect
+---@param qualified boolean? Return schema-qualified names (default false)
+---@return table<string>? tables Referenced table names, or nil on error
+---@return string? error
+function M.get_referenced_tables(query, qualified)
+  local available, err = ffi_module.is_available()
+  if not available then
+    return nil, err
+  end
+
+  local conn, conn_err = query_module.create_connection()
+  if not conn then
+    return nil, conn_err
+  end
+
+  local tables, tables_err = query_module.get_referenced_tables(conn, query, qualified)
+  query_module.close_connection(conn)
+  return tables, tables_err
 end
 
 ---Create a command handler for :DuckDB
