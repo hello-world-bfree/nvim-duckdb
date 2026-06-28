@@ -18,6 +18,14 @@ local conf = require("telescope.config").values
 local actions = require("telescope.actions")
 local action_state = require("telescope.actions.state")
 local previewers = require("telescope.previewers")
+local query = require("duckdb.query")
+
+---Encode a row value to JSON, mapping SQL NULL to JSON null.
+---@param value any
+---@return any
+local function json_value(value)
+  return query.is_null(value) and vim.NIL or value
+end
 
 ---Query history picker
 ---@param opts table?
@@ -153,7 +161,8 @@ function M.results(result, opts)
     local parts = {}
     for j, val in ipairs(row) do
       local col = result.columns[j] or string.format("col%d", j)
-      table.insert(parts, string.format("%s=%s", col, tostring(val or "NULL")))
+      local display = query.is_null(val) and "NULL" or tostring(val)
+      table.insert(parts, string.format("%s=%s", col, display))
     end
     table.insert(entries, {
       idx = i,
@@ -182,7 +191,8 @@ function M.results(result, opts)
           local lines = {}
           for i, col in ipairs(result.columns) do
             local val = entry.value.row[i]
-            table.insert(lines, string.format("%s: %s", col, tostring(val or "NULL")))
+            local display = query.is_null(val) and "NULL" or tostring(val)
+            table.insert(lines, string.format("%s: %s", col, display))
           end
           vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
         end,
@@ -193,7 +203,7 @@ function M.results(result, opts)
           if selection then
             local obj = {}
             for i, col in ipairs(result.columns) do
-              obj[col] = selection.value.row[i]
+              obj[col] = json_value(selection.value.row[i])
             end
             local json = vim.json.encode(obj)
             vim.fn.setreg("+", json)
@@ -207,7 +217,7 @@ function M.results(result, opts)
           if selection then
             local obj = {}
             for i, col in ipairs(result.columns) do
-              obj[col] = selection.value.row[i]
+              obj[col] = json_value(selection.value.row[i])
             end
             local json = vim.json.encode(obj)
             vim.fn.setreg("+", json)

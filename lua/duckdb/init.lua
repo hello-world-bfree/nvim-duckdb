@@ -295,7 +295,11 @@ function M.query_as_table(query, buffer_id)
   for _, row in ipairs(result.rows) do
     local obj = {}
     for i, col in ipairs(result.columns) do
-      obj[col] = row[i]
+      -- Expose SQL NULL as Lua nil in the returned table API.
+      local value = row[i]
+      if not query_module.is_null(value) then
+        obj[col] = value
+      end
     end
     table.insert(rows, obj)
   end

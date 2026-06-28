@@ -2,11 +2,29 @@
 local M = {}
 
 local ffi = require("ffi")
+local bit = require("bit")
 local duckdb_ffi = require("duckdb.ffi")
 local buffer_module = require("duckdb.buffer")
 
 -- Type constants for cleaner code
 local T = duckdb_ffi.types
+
+-- Sentinel for SQL NULL in result rows. Using a distinct non-nil value (rather
+-- than Lua nil) keeps rows hole-free so that `ipairs(row)` and `#row` stay
+-- correct even when a column is NULL. Renders as an empty string; encode it as
+-- JSON null via M.is_null() at export sites.
+M.NULL = setmetatable({}, {
+  __tostring = function()
+    return ""
+  end,
+})
+
+---Test whether a result-row value is SQL NULL.
+---@param value any
+---@return boolean
+function M.is_null(value)
+  return value == M.NULL
+end
 
 ---@class DuckDBConnection
 ---@field db ffi.cdata* Database handle
@@ -67,22 +85,83 @@ local function format_time(micros)
   return string.format("%02d:%02d:%02d.%06d", hours, minutes, seconds, us)
 end
 
----Format hugeint (128-bit signed integer) to string
----@param hugeint ffi.cdata* duckdb_hugeint structure
+---Convert an unsigned 128-bit magnitude (upper:uint64, lower:uint64) to a
+---base-10 string via repeated long-division by 10. LuaJIT lacks native 128-bit
+---arithmetic, so we divide the two 64-bit halves manually, carrying the
+---remainder from the high half into the low half.
+---@param upper ffi.cdata* uint64_t high 64 bits
+---@param lower ffi.cdata* uint64_t low 64 bits
+---@return string
+local function u128_to_decimal(upper, lower)
+  if upper == 0 and lower == 0 then
+    return "0"
+  end
+
+  local digits = {}
+  -- Loop until the full 128-bit value reaches zero.
+  while upper ~= 0 or lower ~= 0 do
+    -- Divide high half; its remainder becomes the top bits of the low half.
+    local up_q = upper / 10ULL
+    local up_r = upper % 10ULL
+    -- low_dividend = up_r * 2^64 + lower, computed as two unsigned divisions
+    -- to avoid overflow: split 2^64 into (2^64 / 10) and (2^64 % 10).
+    local lo_q = lower / 10ULL
+    local lo_r = lower % 10ULL
+    -- Contribution of the carried remainder (up_r) across the 2^64 boundary.
+    local carry_q = up_r * 1844674407370955161ULL -- floor(2^64 / 10)
+    local carry_r = up_r * 6ULL -- 2^64 mod 10 == 6
+    lo_q = lo_q + carry_q + (lo_r + carry_r) / 10ULL
+    local rem = (lo_r + carry_r) % 10ULL
+
+    table.insert(digits, 1, tostring(tonumber(rem)))
+    upper = up_q
+    lower = lo_q
+  end
+
+  return table.concat(digits)
+end
+
+---Format a signed hugeint (128-bit) to its exact base-10 string.
+---@param hugeint ffi.cdata* duckdb_hugeint structure {uint64 lower; int64 upper}
 ---@return string
 local function format_hugeint(hugeint)
-  local upper = tonumber(hugeint.upper)
-  local lower = tonumber(hugeint.lower)
+  local upper = hugeint.upper
+  local lower = hugeint.lower
 
-  if upper == 0 then
-    return tostring(lower)
-  elseif upper == -1 and lower >= 0x8000000000000000ULL then
-    -- Small negative number
-    return tostring(lower - 0x10000000000000000)
-  else
-    -- Large number - show approximation
-    return string.format("%d*2^64+%u", upper, lower)
+  if upper >= 0 then
+    return u128_to_decimal(ffi.cast("uint64_t", upper), lower)
   end
+
+  -- Negative: take the two's-complement magnitude of the full 128-bit value
+  -- (~value + 1 across both 64-bit words) then prefix '-'. The carry from the
+  -- low word propagates into the high word iff the negated low word wraps to 0.
+  local mag_lower = bit.bnot(ffi.cast("uint64_t", lower)) + 1ULL
+  local carry = (mag_lower == 0ULL) and 1ULL or 0ULL
+  local mag_upper = bit.bnot(ffi.cast("uint64_t", upper)) + carry
+  return "-" .. u128_to_decimal(mag_upper, mag_lower)
+end
+
+---Insert a decimal point `scale` digits from the right of an integer string.
+---@param int_str string Unscaled integer (may start with '-')
+---@param scale number Number of fractional digits
+---@return string
+local function apply_decimal_scale(int_str, scale)
+  if scale == 0 then
+    return int_str
+  end
+
+  local sign = ""
+  if int_str:sub(1, 1) == "-" then
+    sign = "-"
+    int_str = int_str:sub(2)
+  end
+
+  if #int_str <= scale then
+    int_str = string.rep("0", scale - #int_str + 1) .. int_str
+  end
+
+  local split = #int_str - scale
+  return sign .. int_str:sub(1, split) .. "." .. int_str:sub(split + 1)
 end
 
 ---Format interval to string
@@ -115,8 +194,9 @@ end
 ---@param col_type number Column type enum value
 ---@param row number Row index within chunk (0-based)
 ---@param validity ffi.cdata*? Validity mask (nil if no NULLs in column)
+---@param decimal_info table? {internal_type, scale} for DECIMAL columns
 ---@return any value
-local function extract_vector_value(vector, col_type, row, validity)
+local function extract_vector_value(vector, col_type, row, validity, decimal_info)
   -- Check NULL via validity mask
   if validity ~= nil and not duckdb_ffi.C.duckdb_validity_row_is_valid(validity, row) then
     return nil
@@ -179,37 +259,249 @@ local function extract_vector_value(vector, col_type, row, validity)
   elseif col_type == T.HUGEINT then
     local hugeint_data = ffi.cast("duckdb_hugeint*", data)
     return format_hugeint(hugeint_data + row)
+  elseif col_type == T.DECIMAL then
+    -- DECIMAL is stored as a scaled integer; the storage width depends on
+    -- precision (int16/int32/int64/hugeint). Read the raw integer per its
+    -- internal type, then place the decimal point `scale` digits from the right.
+    local internal = decimal_info and decimal_info.internal_type
+    local scale = decimal_info and decimal_info.scale or 0
+    local int_str
+    if internal == T.SMALLINT then
+      int_str = tostring(ffi.cast("int16_t*", data)[row])
+    elseif internal == T.INTEGER then
+      int_str = tostring(ffi.cast("int32_t*", data)[row])
+    elseif internal == T.BIGINT then
+      int_str = string.format("%d", ffi.cast("int64_t*", data)[row])
+    elseif internal == T.HUGEINT then
+      int_str = format_hugeint(ffi.cast("duckdb_hugeint*", data) + row)
+    else
+      return string.format("[%s]", duckdb_ffi.type_names[col_type] or "DECIMAL")
+    end
+    return apply_decimal_scale(int_str, scale)
   elseif col_type == T.UHUGEINT then
     local uhugeint_data = ffi.cast("duckdb_uhugeint*", data)
-    -- Simple representation for unsigned 128-bit
-    local upper = tonumber(uhugeint_data[row].upper)
-    local lower = tonumber(uhugeint_data[row].lower)
-    if upper == 0 then
-      return tostring(lower)
-    else
-      return string.format("%u*2^64+%u", upper, lower)
-    end
+    return u128_to_decimal(uhugeint_data[row].upper, uhugeint_data[row].lower)
   elseif col_type == T.UUID then
-    -- UUID is stored as hugeint, format as UUID string
+    -- DuckDB stores UUID as a hugeint with the high bit flipped (so unsigned
+    -- ordering matches). Flip it back to recover the true 128-bit value, then
+    -- render as canonical RFC 4122 dashed hex (8-4-4-4-12).
     local uuid_data = ffi.cast("duckdb_hugeint*", data)
-    local upper = uuid_data[row].upper
-    local lower = uuid_data[row].lower
-    -- Format as UUID (simplified)
-    return string.format("%016x%016x", tonumber(upper), tonumber(lower))
+    local hi = bit.bxor(ffi.cast("uint64_t", uuid_data[row].upper), 0x8000000000000000ULL)
+    local lo = ffi.cast("uint64_t", uuid_data[row].lower)
+    local hex = string.format("%016x%016x", hi, lo)
+    return string.format(
+      "%s-%s-%s-%s-%s",
+      hex:sub(1, 8),
+      hex:sub(9, 12),
+      hex:sub(13, 16),
+      hex:sub(17, 20),
+      hex:sub(21, 32)
+    )
   else
-    -- For unsupported types (LIST, STRUCT, MAP, ENUM, etc.), return type name
+    -- Truly unsupported leaf types fall back to a type-name placeholder.
     return string.format("[%s]", duckdb_ffi.type_names[col_type] or "UNKNOWN")
   end
 end
+
+local C = duckdb_ffi.C
+
+---Destroy a logical type handle obtained from an accessor.
+---@param logical ffi.cdata*
+local function destroy_logical(logical)
+  if logical ~= nil then
+    local ptr = ffi.new("duckdb_logical_type[1]", logical)
+    C.duckdb_destroy_logical_type(ptr)
+  end
+end
+
+---Read a duckdb_free-owned C string and free it.
+---@param c_str ffi.cdata* char* that must be freed with duckdb_free
+---@return string
+local function take_owned_string(c_str)
+  if c_str == nil then
+    return ""
+  end
+  local s = ffi.string(c_str)
+  C.duckdb_free(c_str)
+  return s
+end
+
+---Read an ENUM value: look up the dictionary string by the stored index.
+---@param vector ffi.cdata*
+---@param logical ffi.cdata* ENUM logical type
+---@param row number
+---@return string
+local function extract_enum_value(vector, logical, row)
+  local internal = tonumber(C.duckdb_enum_internal_type(logical))
+  local data = C.duckdb_vector_get_data(vector)
+  if data == nil then
+    return ""
+  end
+
+  local idx
+  if internal == T.UTINYINT then
+    idx = tonumber(ffi.cast("uint8_t*", data)[row])
+  elseif internal == T.USMALLINT then
+    idx = tonumber(ffi.cast("uint16_t*", data)[row])
+  else
+    idx = tonumber(ffi.cast("uint32_t*", data)[row])
+  end
+
+  return take_owned_string(C.duckdb_enum_dictionary_value(logical, idx))
+end
+
+-- Forward declaration for mutual recursion.
+local extract_value
+
+---Extract one element from a child vector at a flat index, given the child's
+---logical type. Handles NULL via the child vector's own validity mask.
+---@param child_vector ffi.cdata*
+---@param child_logical ffi.cdata* (NOT destroyed here; owned by caller)
+---@param idx number Flat index into the child vector
+---@return any
+local function extract_child(child_vector, child_logical, idx)
+  local validity = C.duckdb_vector_get_validity(child_vector)
+  return extract_value(child_vector, child_logical, idx, validity)
+end
+
+---Recursively extract a value, descending into nested types.
+---@param vector ffi.cdata*
+---@param logical ffi.cdata* Logical type for this vector (owned by caller)
+---@param row number Row index within this vector
+---@param validity ffi.cdata*? Validity mask for this vector
+---@return any
+extract_value = function(vector, logical, row, validity)
+  if validity ~= nil and not C.duckdb_validity_row_is_valid(validity, row) then
+    return nil
+  end
+
+  local type_id = tonumber(C.duckdb_get_type_id(logical))
+
+  if type_id == T.LIST then
+    -- Row holds a {offset, length} entry into the flat child vector.
+    local data = C.duckdb_vector_get_data(vector)
+    local entry = ffi.cast("duckdb_list_entry*", data)[row]
+    local child_vector = C.duckdb_list_vector_get_child(vector)
+    local child_logical = C.duckdb_list_type_child_type(logical)
+    local offset = tonumber(entry.offset)
+    local length = tonumber(entry.length)
+    -- Tag kind + length explicitly: list elements may be NULL (nil), which
+    -- would create holes that ipairs/# cannot traverse reliably.
+    local out = { __kind = "list", n = length }
+    for i = 0, length - 1 do
+      out[i + 1] = extract_child(child_vector, child_logical, offset + i)
+    end
+    destroy_logical(child_logical)
+    return out
+  elseif type_id == T.ARRAY then
+    -- Fixed-size array: child elements are contiguous at row * size.
+    local size = tonumber(C.duckdb_array_type_array_size(logical))
+    local child_vector = C.duckdb_array_vector_get_child(vector)
+    local child_logical = C.duckdb_array_type_child_type(logical)
+    local base = row * size
+    local out = { __kind = "list", n = size }
+    for i = 0, size - 1 do
+      out[i + 1] = extract_child(child_vector, child_logical, base + i)
+    end
+    destroy_logical(child_logical)
+    return out
+  elseif type_id == T.STRUCT then
+    -- Each child is a parallel vector indexed by the same row.
+    local count = tonumber(C.duckdb_struct_type_child_count(logical))
+    local out = { __kind = "struct", fields = {} }
+    for c = 0, count - 1 do
+      local name = take_owned_string(C.duckdb_struct_type_child_name(logical, c))
+      local child_vector = C.duckdb_struct_vector_get_child(vector, c)
+      local child_logical = C.duckdb_struct_type_child_type(logical, c)
+      out.fields[c + 1] = { name = name, value = extract_child(child_vector, child_logical, row) }
+      destroy_logical(child_logical)
+    end
+    return out
+  elseif type_id == T.MAP then
+    -- A MAP is stored as a LIST of STRUCT(key, value). Descend the list entry,
+    -- then read the two struct children for each element.
+    local data = C.duckdb_vector_get_data(vector)
+    local entry = ffi.cast("duckdb_list_entry*", data)[row]
+    local list_child = C.duckdb_list_vector_get_child(vector) -- STRUCT vector
+    local key_vector = C.duckdb_struct_vector_get_child(list_child, 0)
+    local value_vector = C.duckdb_struct_vector_get_child(list_child, 1)
+    local key_logical = C.duckdb_map_type_key_type(logical)
+    local value_logical = C.duckdb_map_type_value_type(logical)
+    local offset = tonumber(entry.offset)
+    local length = tonumber(entry.length)
+    local out = { __kind = "map", n = length }
+    for i = 0, length - 1 do
+      out[i + 1] = {
+        key = extract_child(key_vector, key_logical, offset + i),
+        value = extract_child(value_vector, value_logical, offset + i),
+      }
+    end
+    destroy_logical(key_logical)
+    destroy_logical(value_logical)
+    return out
+  elseif type_id == T.ENUM then
+    return extract_enum_value(vector, logical, row)
+  elseif type_id == T.DECIMAL then
+    return extract_vector_value(vector, type_id, row, nil, {
+      scale = tonumber(C.duckdb_decimal_scale(logical)),
+      internal_type = tonumber(C.duckdb_decimal_internal_type(logical)),
+    })
+  else
+    -- Scalar leaf: validity already checked above, so pass nil to skip recheck.
+    return extract_vector_value(vector, type_id, row, nil)
+  end
+end
+
+---Render an extracted value (scalar or nested table) to a display string,
+---using DuckDB-like syntax: lists as [a, b], structs/maps as {k: v}. Nested
+---tables are tagged with `__kind` so NULL elements (nil holes) render safely.
+---@param value any
+---@return string
+local function render_value(value)
+  if value == nil then
+    return "NULL"
+  end
+  if type(value) ~= "table" then
+    return tostring(value)
+  end
+
+  local kind = value.__kind
+  if kind == "list" then
+    local parts = {}
+    for i = 1, value.n do
+      parts[i] = render_value(value[i])
+    end
+    return "[" .. table.concat(parts, ", ") .. "]"
+  elseif kind == "map" then
+    local parts = {}
+    for i = 1, value.n do
+      local kv = value[i]
+      parts[i] = render_value(kv.key) .. "=" .. render_value(kv.value)
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
+  elseif kind == "struct" then
+    local parts = {}
+    for i, field in ipairs(value.fields) do
+      parts[i] = string.format("%s: %s", field.name, render_value(field.value))
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
+  end
+
+  -- Unknown table shape: best-effort positional render.
+  return "[" .. tostring(value) .. "]"
+end
+
+M._render_value = render_value
 
 -- ============================================================================
 -- Connection Management
 -- ============================================================================
 
 ---Create a new DuckDB connection
+---@param path string? File path for a persistent database; nil opens in-memory
 ---@return DuckDBConnection? connection
 ---@return string? error
-function M.create_connection()
+function M.create_connection(path)
   if not duckdb_ffi.lib then
     return nil, "DuckDB library not loaded"
   end
@@ -217,8 +509,8 @@ function M.create_connection()
   local db = ffi.new("duckdb_database[1]")
   local conn = ffi.new("duckdb_connection[1]")
 
-  -- Open in-memory database
-  local state = duckdb_ffi.C.duckdb_open(nil, db)
+  -- Open a persistent file database when a path is given, else in-memory.
+  local state = duckdb_ffi.C.duckdb_open(path, db)
   if state ~= 0 then
     return nil, "Failed to open DuckDB database"
   end
@@ -300,6 +592,12 @@ function M.execute_query(connection, query)
     if err_ptr ~= nil then
       error_msg = ffi.string(err_ptr)
     end
+    -- Classify the error by DuckDB's own error category for clearer diagnostics.
+    local err_type = tonumber(duckdb_ffi.C.duckdb_result_error_type(result))
+    local category = duckdb_ffi.error_type_names[err_type]
+    if category and category ~= "INVALID" then
+      error_msg = string.format("[%s] %s", category, error_msg)
+    end
     duckdb_ffi.C.duckdb_destroy_result(result)
     return nil, error_msg
   end
@@ -308,8 +606,21 @@ function M.execute_query(connection, query)
   local column_count = tonumber(duckdb_ffi.C.duckdb_column_count(result))
   local rows_changed = tonumber(duckdb_ffi.C.duckdb_rows_changed(result))
 
+  -- Types that need the logical type for extraction (recursive / dictionary /
+  -- scaled). These take the slower logical-type-driven path; everything else
+  -- uses the fast raw-buffer cast.
+  local complex_types = {
+    [T.LIST] = true,
+    [T.ARRAY] = true,
+    [T.STRUCT] = true,
+    [T.MAP] = true,
+    [T.ENUM] = true,
+    [T.DECIMAL] = true,
+  }
+
   local columns = {}
   local column_types = {}
+  local has_complex = false
   for col = 0, column_count - 1 do
     local col_name = duckdb_ffi.C.duckdb_column_name(result, col)
     if col_name ~= nil then
@@ -317,7 +628,11 @@ function M.execute_query(connection, query)
     else
       table.insert(columns, string.format("column_%d", col))
     end
-    table.insert(column_types, tonumber(duckdb_ffi.C.duckdb_column_type(result, col)))
+    local col_type = tonumber(duckdb_ffi.C.duckdb_column_type(result, col))
+    table.insert(column_types, col_type)
+    if complex_types[col_type] then
+      has_complex = true
+    end
   end
 
   -- Extract row data using data chunks (modern API)
@@ -334,27 +649,47 @@ function M.execute_query(connection, query)
     local chunk_size = tonumber(duckdb_ffi.C.duckdb_data_chunk_get_size(chunk))
     total_row_count = total_row_count + chunk_size
 
-    -- Cache vectors and validity masks for this chunk
+    -- Cache vectors, validity masks, and (for complex columns) logical types.
     local vectors = {}
     local validities = {}
+    local logicals = {}
     for col = 0, column_count - 1 do
       vectors[col] = duckdb_ffi.C.duckdb_data_chunk_get_vector(chunk, col)
       validities[col] = duckdb_ffi.C.duckdb_vector_get_validity(vectors[col])
+      if complex_types[column_types[col + 1]] then
+        logicals[col] = duckdb_ffi.C.duckdb_vector_get_column_type(vectors[col])
+      end
     end
 
     -- Extract rows from this chunk
     for row = 0, chunk_size - 1 do
       local row_data = {}
       for col = 0, column_count - 1 do
-        local value = extract_vector_value(
-          vectors[col],
-          column_types[col + 1],
-          row,
-          validities[col]
-        )
-        table.insert(row_data, value)
+        local value
+        if logicals[col] ~= nil then
+          local extracted = extract_value(vectors[col], logicals[col], row, validities[col])
+          -- Render nested/enum/decimal values to display strings; a top-level
+          -- NULL extracts to nil and becomes the NULL sentinel below.
+          if extracted ~= nil then
+            value = render_value(extracted)
+          end
+        else
+          value = extract_vector_value(vectors[col], column_types[col + 1], row, validities[col])
+        end
+        -- Store the NULL sentinel (not Lua nil) so the column slot is preserved:
+        -- table.insert/ipairs/# all mishandle nil holes and would misalign rows.
+        row_data[col + 1] = value ~= nil and value or M.NULL
       end
-      table.insert(rows, row_data)
+      rows[#rows + 1] = row_data
+    end
+
+    -- Release per-chunk logical types before fetching the next chunk.
+    if has_complex then
+      for col = 0, column_count - 1 do
+        if logicals[col] ~= nil then
+          destroy_logical(logicals[col])
+        end
+      end
     end
 
     -- Destroy chunk after processing

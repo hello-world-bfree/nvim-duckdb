@@ -42,6 +42,13 @@ local function check_duckdb_lib()
   local available, err = duckdb_ffi.is_available()
   if available then
     health.ok('DuckDB library found and loaded successfully')
+    local ver_ok, version = pcall(function()
+      local ffi = require('ffi')
+      return ffi.string(duckdb_ffi.C.duckdb_library_version())
+    end)
+    if ver_ok and version then
+      health.info(string.format('libduckdb C API version: %s', version))
+    end
     return true
   else
     health.error('DuckDB library not found', {

@@ -1,6 +1,18 @@
 ---@class DuckDBActions
 local M = {}
 
+local query = require("duckdb.query")
+
+---Map a result-row value for JSON encoding: SQL NULL becomes JSON null.
+---@param value any
+---@return any
+local function json_value(value)
+  if query.is_null(value) then
+    return vim.NIL
+  end
+  return value
+end
+
 ---@class ResultMetadata
 ---@field query string Original query
 ---@field result QueryResult The query result
@@ -60,7 +72,7 @@ function M.format_json_array(result)
   for _, row in ipairs(result.rows) do
     local obj = {}
     for i, col in ipairs(result.columns) do
-      obj[col] = row[i]
+      obj[col] = json_value(row[i])
     end
     table.insert(rows, obj)
   end
@@ -76,10 +88,10 @@ function M.format_json_object(result)
   end
   local obj = {}
   for _, row in ipairs(result.rows) do
-    local key = tostring(row[1])
+    local key = query.is_null(row[1]) and "" or tostring(row[1])
     local val = {}
     for i = 2, #result.columns do
-      val[result.columns[i]] = row[i]
+      val[result.columns[i]] = json_value(row[i])
     end
     obj[key] = val
   end
@@ -95,7 +107,7 @@ function M.format_json_single(result)
   end
   local obj = {}
   for i, col in ipairs(result.columns) do
-    obj[col] = result.rows[1][i]
+    obj[col] = json_value(result.rows[1][i])
   end
   return vim.json.encode(obj)
 end

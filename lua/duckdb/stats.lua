@@ -37,10 +37,15 @@ end
 local function parse_summarize_result(result)
   local columns = {}
 
+  local query_module = require("duckdb.query")
   for _, row in ipairs(result.rows) do
     local stats = {}
     for i, col in ipairs(result.columns) do
-      stats[col:lower()] = row[i]
+      -- Treat SQL NULL summary fields (e.g. min/max/avg) as absent.
+      local value = row[i]
+      if not query_module.is_null(value) then
+        stats[col:lower()] = value
+      end
     end
 
     local col_stats = {

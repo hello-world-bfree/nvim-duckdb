@@ -1,6 +1,8 @@
 ---@class DuckDBUI
 local M = {}
 
+local query = require("duckdb.query")
+
 ---@class DisplayOptions
 ---@field max_rows number? Maximum rows to display (default: 1000)
 ---@field max_col_width number? Maximum column width (default: 50)
@@ -10,7 +12,7 @@ local M = {}
 ---@param value any
 ---@return string
 local function format_value(value)
-  if value == nil then
+  if value == nil or query.is_null(value) then
     return "NULL"
   elseif type(value) == "boolean" then
     return value and "true" or "false"
@@ -299,7 +301,9 @@ function M.format_as_json(result)
   for _, row in ipairs(result.rows) do
     local obj = {}
     for i, col in ipairs(result.columns) do
-      obj[col] = row[i]
+      local value = row[i]
+      -- Encode SQL NULL as JSON null (vim.NIL), not the sentinel table.
+      obj[col] = query.is_null(value) and vim.NIL or value
     end
     table.insert(rows, obj)
   end
